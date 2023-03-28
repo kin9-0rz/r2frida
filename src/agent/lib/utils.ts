@@ -1,7 +1,7 @@
 import { SwiftAvailable } from "./darwin/swift.js";
+import { r2frida } from "../plugin.js";
 
 declare let Swift: any;
-declare let global: any;
 
 const minPrintable = ' '.charCodeAt(0);
 const maxPrintable = '~'.charCodeAt(0);
@@ -158,12 +158,13 @@ export function rwxint(x: string): number {
     return ops.indexOf(x);
 }
 
-export function getPtr(p: any) {
+// TODO: make return optional
+export function getPtr(p: any) : NativePointer {
     if (typeof p === 'string') {
         p = p.trim();
     }
     if (!p || p === '$$') {
-        return ptr(global.r2frida.offset);
+        return ptr(r2frida.offset);
     }
     if (p.startsWith('swift:')) {
         if (!SwiftAvailable()) {
@@ -178,7 +179,7 @@ export function getPtr(p: any) {
         const method = km[1];
         if (!Swift.classes[klass]) {
             console.error('Missing class ' + klass);
-            return;
+            return ptr(0);
         }
         const klassDefinition = Swift.classes[klass];
         let targetAddress = ptr(0);
@@ -251,7 +252,11 @@ export function getPtr(p: any) {
         // console.error(e);
     }
     // return DebugSymbol.fromAddress(ptr_p) || '' + ptr_p;
-    return Module.findExportByName(null, p);
+    const res = Module.findExportByName(null, p);
+    if (res === null) {
+      return ptr(0);
+    }
+    return res;
 }
 
 export function autoType(args: string[]) {
@@ -315,4 +320,22 @@ export function arrayBufferToHex(arrayBuffer: any) {
 
 export function belongsTo(modules: any[], addr: NativePointer) {
     return modules.filter(m => addr.compare(m.vmaddr) >= 0 && addr.compare(m.vmaddr.add(m.vmsize)) < 0);
+}
+
+export function Hexdump(lenstr: number): string {
+    const len = +lenstr || 32;
+    try {
+        const ptroff = ptr(r2frida.offset);
+        const options: HexdumpOptions = {
+            // offset: global.r2frida.offset,
+            length: len,
+        };
+        return hexdump(ptroff, options) || '';
+    } catch (e: any) {
+        return "Cannot read memory";
+    }
+}
+
+export default {
+    Hexdump
 }
