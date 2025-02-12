@@ -1,6 +1,6 @@
 {
   "name": "r2frida-agent",
-  "version": "5.8.2",
+  "version": "5.9.8",
   "description": "Agent for frida:// io plugin",
   "private": true,
   "type": "module",
@@ -15,17 +15,17 @@
   },
   "license": "LGPL-3.0",
   "engines": {
-    "node": ">=14.16"
+    "node": ">=20.0"
   },
   "devDependencies": {
     "@frida/events": "^4.0.4",
-    "@types/frida-gum": "^18.3.1",
-    "@types/node": "^18.0.0",
+    "@types/frida-gum": "^18.7.1",
+    "@types/node": "^22.10.1",
     "@typescript-eslint/eslint-plugin": "^5.51.0",
     "@typescript-eslint/parser": "^5.51.0",
     "eslint": "^8.34.0",
-    "frida-compile": "^16.1.5",
-    "typescript": "^4.9.5"
+    "frida-compile": "^16.2.2",
+    "typescript": "^5.7.2"
   },
   "exports": {
     "require": "./src/agent/index.js",

@@ -1,178 +1,71 @@
-import config from '../../config.js';
-import r2 from '../r2.js';
+
 import sys from '../sys.js';
-import { autoType, getPtr, padPointer } from '../utils.js';
+import { autoType, getPtr, padPointer, byteArrayToHex } from '../utils.js';
+import { currentThreadContext } from "./breakpoints.js";
 
-const newBreakpoints = new Map();
-let suspended = false;
+const regProfileAliasForArm64 = `
+=PC pc
+=SP sp
+=BP x29
+=A0 x0
+=A1 x1
+=A2 x2
+=A3 x3
+=ZF zf
+=SF nf
+=OF vf
+=CF cf
+=SN x8
+`;
 
-export function isSuspended() : boolean {
-    return suspended;
-}
+const regProfileAliasForArm = `
+=PC r15
+=LR r14
+=SP sp
+=BP fp
+=A0 r0
+=A1 r1
+=A2 r2
+=A3 r3
+=ZF zf
+=SF nf
+=OF vf
+=CF cf
+=SN r7
+`;
 
-export function setSuspended(v: boolean) {
-    suspended = v;
-}
+const regProfileAliasForX64 = `
+=PC rip
+=SP rsp
+=BP rbp
+=A0 rdi
+=A1 rsi
+=A2 rdx
+=A3 rcx
+=A4 r8
+=A5 r9
+=SN rax
+`;
 
-/* breakpoint handler */
-Process.setExceptionHandler(({ address }) => {
-    const bp = newBreakpoints.get(address.toString());
-    if (!bp) {
-        return false;
-    }
-    const index = bp.patches.findIndex((p: any) => p.address.equals(address));
-    if (index === 0) {
-        send({ name: 'breakpoint-event', stanza: { cmd: bp.cmd } });
-        let state = 'stopped';
-        if (config.getBoolean('hook.verbose')) {
-            console.log(`Breakpoint ${address} hit`);
-        }
-        do {
-            const op = recv('breakpoint-action', ({ action }) => {
-                switch (action) {
-                    case 'register-change':
-                        console.log('TODO1');
-                        break;
-                    case 'resume':
-                        state = 'running';
-                        if (config.getBoolean('hook.verbose')) {
-                            console.log('Continue thread(s).');
-                        }
-                        break;
-                    default:
-                        console.log('TODO2');
-                        break;
-                }
-            });
-            op.wait();
-        } while (state === 'stopped');
-    }
-    const afterBp = newBreakpoints.get(address.toString());
-    if (afterBp) {
-        for (const p of bp.patches) {
-            p.toggle();
-        }
-    }
-    return true;
-});
-
-export class CodePatch {
-    insn: any;
-    _newData: any;
-    _originalData: any;
-    _applied: boolean;
-    constructor(address: NativePointer) {
-        const insn = Instruction.parse(address);
-        this.address = address;
-        this.insn = insn;
-        const insnSize = insn.size;
-        this._newData = breakpointInstruction();
-        this._originalData = address.readByteArray(insnSize);
-        this._applied = false;
-    }
-
-    toggle() {
-        this._apply(this._applied ? this._originalData : this._newData);
-        this._applied = !this._applied;
-    }
-    enable() {
-        if (!this._applied) {
-            this.toggle();
-        }
-    }
-
-    disable() {
-        if (this._applied) {
-            this.toggle();
-        }
-    }
-    address: any;
-    _apply(data: any) {
-        Memory.patchCode(this.address, data.byteLength, code => {
-            code.writeByteArray(data);
-        });
-    }
-}
-
-export function breakpointInstruction() {
-    if (Process.arch === 'arm64') {
-        return new Uint8Array([0x60, 0x00, 0x20, 0xd4]).buffer;
-    }
-    return new Uint8Array([0xcc]).buffer;
-}
-
-export function breakpointNative(args: string[]) {
-    if (args.length === 0) {
-        _breakpointList([]);
-    } else if (args[0].startsWith('-')) {
-        const addr = args[0].substring(1);
-        breakpointUnset([addr]);
-    } else {
-        _breakpointSet(args);
-    }
-}
-
-export function breakpointJson() {
-    const json: any = {};
-    for (const [address, bp] of newBreakpoints.entries()) {
-        if (bp.patches[0].address.equals(ptr(address))) {
-            const k = '' + bp.patches[0].address;
-            json[k] = {};
-            json[k].enabled = true;
-            if (bp.cmd) {
-                json[k].cmd = bp.cmd;
-            }
-        }
-    }
-    return JSON.stringify(json);
-}
-
-export function breakpointNativeCommand(args: string[]) {
-    if (args.length >= 2) {
-        const address = args[0];
-        const command = args.slice(1).join(' ');
-        for (const [bpaddr, bp] of newBreakpoints.entries()) {
-            if (bp.patches[0].address.equals(ptr(bpaddr))) {
-                if (bpaddr === address) {
-                    bp.cmd = command;
-                    break;
-                }
-            }
-        }
-    } else {
-        console.error('Usage: dbc [address-of-breakpoint] [r2-command-to-run-when-hit]');
-    }
-}
-
-export function breakpointUnset(args: string[]) {
-    const addr = getPtr(args[0]).toString();
-    const bp = newBreakpoints.get(addr);
-    for (const p of bp.patches) {
-        p.disable();
-        newBreakpoints.delete(p.address.toString());
-    }
-}
-
-export function breakpointContinue(args: string[]) {
-    if (suspended) {
-        suspended = false;
-        return r2.hostCmd(':dc');
-    }
-    return 'Continue thread(s).';
-}
-
-export function breakpointContinueUntil(args: string[]) {
-    breakpointNative(args);
-    breakpointContinue([]);
-    breakpointNative(['-' + args[0]]);
-}
+const regProfileAliasForX86 = `
+=PC eip
+=SP esp
+=BP ebp
+=A0 eax
+=A1 ebx
+=A2 ecx
+=A3 edx
+=A4 esi
+=A5 edi
+=SN eax
+`;
 
 export function sendSignal(args: string[]) {
     const argsLength = args.length;
     console.error('WARNING: Frida hangs when signal is sent. But at least the process doesnt continue');
     if (argsLength === 1) {
         const sig = +args[0];
-        sys._kill!(sys._getpid!(), sig);
+        sys._kill!(Process.id, sig);
     } else if (argsLength === 2) {
         const [pid, sig] = args;
         sys._kill!(+pid, +sig);
@@ -180,26 +73,6 @@ export function sendSignal(args: string[]) {
         return 'Usage: :dk ([pid]) [sig]';
     }
     return '';
-}
-
-function _breakpointList(args: string[]) {
-    for (const [address, bp] of newBreakpoints.entries()) {
-        if (bp.patches[0].address.equals(ptr(address))) {
-            console.log(address);
-        }
-    }
-}
-
-function _breakpointSet(args: string[]) {
-    const ptrAddr = getPtr(args[0]);
-    const p1 = new CodePatch(ptrAddr) as any;
-    const p2 = new CodePatch(p1.insn.next);
-    const bp = {
-        patches: [p1, p2]
-    };
-    newBreakpoints.set(p1.address.toString(), bp);
-    newBreakpoints.set(p2.address.toString(), bp);
-    p1.toggle();
 }
 
 export function dxCall(args: string[]) {
@@ -242,7 +115,7 @@ function _resolveSyscallNumber(name: string): number | string {
     return '' + name;
 }
 
-export function listThreads() {
+export function listThreads() : string {
     return Process.enumerateThreads().map((thread) => {
         const threadName = _getThreadName(thread.id);
         return [thread.id, threadName].join(' ');
@@ -254,23 +127,35 @@ export function listThreadsJson() {
         .map(thread => thread.id);
 }
 
-export function dumpRegisters(args: string[]) {
+export function dumpRegistersHere() : string {
+    if (currentThreadContext === null) {
+        return "No breakpoint set";
+    }
+    const values = _formatContext(currentThreadContext);
+    return values.join('');
+}
+
+export function dumpRegisters(args: string[]) : string {
+    return dumpRegistersJson(args).join('\n\n') + '\n';
+}
+
+function _formatContext(context: CpuContext): string[] {
+    const names = Object.keys(JSON.parse(JSON.stringify(context)));
+    names.sort(_compareRegisterNames);
+    const values = names
+        .map((name, index) => _alignRight(name, 3) + ' : ' + padPointer((context as any)[name]))
+        .map(_indent);
+    return values;
+}
+
+export function dumpRegistersJson(args: string[]) {
     return _getThreads(args[0])
         .map(thread => {
             const { id, state, context } = thread;
             const heading = `tid ${id} ${state}`;
-            const names = Object.keys(JSON.parse(JSON.stringify(context)));
-            names.sort(_compareRegisterNames);
-            const values = names
-                .map((name, index) => _alignRight(name, 3) + ' : ' + padPointer((context as any)[name]))
-                .map(_indent);
+            const values = _formatContext(context);
             return heading + '\n' + values.join('');
         })
-        .join('\n\n') + '\n';
-}
-
-export function dumpRegistersJson(args: string[]) {
-    return _getThreads(args[0]);
 }
 
 function _getThreads(threadid: string) {
@@ -279,8 +164,41 @@ function _getThreads(threadid: string) {
         .filter(thread => tid === undefined || thread.id === tid);
 }
 
-export function dumpRegistersR2(args: string[]) {
+export function dumpRegistersEsil(args: string[]) : string {
     const threads = Process.enumerateThreads();
+    if (threads.length === 0) {
+        // TODO: when process is spawned but not being executed, there are no threads
+        // ODOT: available therefor the list is empty and we cant generate a regprofile
+        return "";
+    }
+    const [tid] = args;
+    const context = tid ? threads.filter(th => th.id === +tid) : threads[0].context;
+    if (!context) {
+        return '';
+    }
+    const names = Object.keys(JSON.parse(JSON.stringify(context)));
+    names.sort(_compareRegisterNames);
+    const values = names
+        .map((name, index) => {
+            if (name === 'pc' || name === 'sp') {
+                return '';
+            }
+            const value = '' + ((context as any)[name] || 0);
+            if (value.indexOf('object') !== -1) {
+                return '';
+            }
+            return `${value},${name},:=`;
+        });
+    return values.join(',');
+}
+
+export function dumpRegistersR2(args: string[]) : string {
+    const threads = Process.enumerateThreads();
+    if (threads.length === 0) {
+        // TODO: when process is spawned but not being executed, there are no threads
+        // ODOT: available therefor the list is empty and we cant generate a regprofile
+        return "";
+    }
     const [tid] = args;
     const context = tid ? threads.filter(th => th.id === +tid) : threads[0].context;
     if (!context) {
@@ -302,7 +220,7 @@ export function dumpRegistersR2(args: string[]) {
     return values.join('');
 }
 
-export function dumpRegistersRecursively(args: string[]) {
+export function dumpRegistersRecursively(args: string[]) : string {
     const [tid] = args;
     Process.enumerateThreads()
         .filter(thread => !tid || !+tid || +tid === thread.id)
@@ -322,8 +240,13 @@ export function dumpRegistersRecursively(args: string[]) {
     return ''; // nothing to see here
 }
 
-export function dumpRegisterProfile(args: string[]) {
+export function dumpRegisterProfile(args: string[]) : string {
     const threads = Process.enumerateThreads();
+    if (threads.length === 0) {
+        // TODO: when process is spawned but not being executed, there are no threads
+        // ODOT: available therefor the list is empty and we cant generate a regprofile
+        return "";
+    }
     const context = threads[0].context;
     const names = Object.keys(JSON.parse(JSON.stringify(context)))
         .filter(_ => _ !== 'pc' && _ !== 'sp');
@@ -340,7 +263,7 @@ export function dumpRegisterProfile(args: string[]) {
 
 export function dumpRegisterArena(args: string[]) {
     const threads = Process.enumerateThreads();
-    if (args.length < 1) {
+    if (threads.length === 0) {
         return "";
     }
     let tidx = +args[0];
@@ -354,28 +277,25 @@ export function dumpRegisterArena(args: string[]) {
     const names = Object.keys(JSON.parse(JSON.stringify(context)))
         .filter(_ => _ !== 'pc' && _ !== 'sp');
     names.sort(_compareRegisterNames);
-    let off = 0;
-    const inc = Process.pointerSize;
-    const buf = Buffer.alloc(inc * names.length);
+    let offset = 0;
+    const regSize = Process.pointerSize;
+    if (regSize !== 4 && regSize !== 8) {
+        console.error("Invalid register size");
+        return;
+    }
+    const buf = [];
     for (const reg of names) {
         const r = context[reg];
         if (typeof r.and !== 'function') {
             continue;
         }
-        const b = [r.and(0xff),
-        r.shr(8).and(0xff),
-        r.shr(16).and(0xff),
-        r.shr(24).and(0xff),
-        r.shr(32).and(0xff),
-        r.shr(40).and(0xff),
-        r.shr(48).and(0xff),
-        r.shr(56).and(0xff)];
-        for (let i = 0; i < inc; i++) {
-            buf.writeUInt8(b[i], off + i);
+        for (let i = 0; i < regSize; i++) {
+            const idx = i * 8;
+            buf.push(r.shr(idx).and(0xff));
         }
-        off += inc;
+        offset += regSize;
     }
-    return buf.toString('hex');
+    return byteArrayToHex(buf);
 }
 
 export function nameFromAddress(address: NativePointer) {
@@ -463,60 +383,15 @@ function _parseRegisterIndex(name: string) {
 function _regProfileAliasFor(arch: string): string {
     switch (arch) {
         case 'arm64':
-            return `=PC pc
-      =SP sp
-      =BP x29
-      =A0 x0
-      =A1 x1
-      =A2 x2
-      =A3 x3
-      =ZF zf
-      =SF nf
-      =OF vf
-      =CF cf
-      =SN x8
-      `;
+            return regProfileAliasForArm64;
         case 'arm':
-            return `=PC r15
-      =LR r14
-      =SP sp
-      =BP fp
-      =A0 r0
-      =A1 r1
-      =A2 r2
-      =A3 r3
-      =ZF zf
-      =SF nf
-      =OF vf
-      =CF cf
-      =SN r7
-      `;
+            return regProfileAliasForArm;
         case 'ia64':
         case 'x64':
-            return `=PC rip
-      =SP rsp
-      =BP rbp
-      =A0 rdi
-      =A1 rsi
-      =A2 rdx
-      =A3 rcx
-      =A4 r8
-      =A5 r9
-      =SN rax
-      `;
+            return regProfileAliasForX64;
         case 'ia32':
         case 'x86':
-            return `=PC eip
-      =SP esp
-      =BP ebp
-      =A0 eax
-      =A1 ebx
-      =A2 ecx
-      =A3 edx
-      =A4 esi
-      =A5 edi
-      =SN eax
-      `;
+            return regProfileAliasForX86;
     }
     return '';
 }

@@ -1,8 +1,11 @@
 include config.mk
 
+PREFIX?=/usr/local
 R2V=$(VERSION)
-R2V?=5.8.4
-frida_version=16.0.11
+R2V?=5.9.4
+# frida_version=16.5.9
+frida_version=$(shell grep 'set frida_version=' make.bat| cut -d = -f 2)
+#frida_version=16.5.9
 frida_major=$(shell echo $(frida_version)|cut -d . -f 1)
 
 ifeq ($(frida_major),15)
@@ -12,7 +15,7 @@ else
 R2FRIDA_PRECOMPILED_AGENT?=0
 endif
 
-R2FRIDA_PRECOMPILED_AGENT_URL=https://github.com/nowsecure/r2frida/releases/download/5.8.2/_agent.js
+R2FRIDA_PRECOMPILED_AGENT_URL=https://github.com/nowsecure/r2frida/releases/download/$(VERSION)/_agent.js
 
 frida_version_major=$(shell echo $(frida_version) | cut -d . -f 1)
 
@@ -28,8 +31,10 @@ endif
 endif
 
 ifeq ($(frida_os),linux)
-HAVE_MUSL=$(shell (test -x /lib/ld-musl*) && echo 1 || echo 0)
+HAVE_MUSL=$(shell (grep -q musl /bin/ls && test -x /lib/ld-musl*) && echo 1 || echo 0)
+R2FRIDA_COMPILE_FLAGS=-Wl,-z,noexecstack
 else
+R2FRIDA_COMPILE_FLAGS=
 HAVE_MUSL=0
 endif
 
@@ -60,6 +65,8 @@ endif
 DESTDIR?=
 
 ifeq ($(shell uname),Darwin)
+# CFLAGS+=-arch arm64e -arch arm64
+# LDFLAGS+=-arch arm64e -arch arm64
 SO_EXT=dylib
 else
 SO_EXT=so
@@ -121,6 +128,7 @@ PLUGIN_LDFLAGS+=-Wl,-exported_symbol,_radare_plugin
   ifeq ($(frida_os),macos)
 FRIDA_LDFLAGS+=-Wl,-no_compact_unwind
 FRIDA_LIBS+=-framework Foundation
+FRIDA_LIBS+=-framework IOKit
   endif
   ifeq ($(frida_os),ios)
 FRIDA_LIBS+=-framework UIKit
@@ -129,6 +137,7 @@ FRIDA_LIBS+=-framework Foundation
   else
   ifeq ($(frida_os),macos)
 FRIDA_LIBS+=-lbsm
+FRIDA_LIBS+=-framework Security
 endif
   endif
   ifeq ($(frida_os),macos)
@@ -146,6 +155,7 @@ endif
 
 ifeq ($(frida_os),linux)
 LDFLAGS+=-Wl,--start-group
+LDFLAGS+=-lm
 endif
 
 ifeq ($(STRIP_SYMBOLS),yes)
@@ -153,7 +163,12 @@ PLUGIN_LDFLAGS+=-Wl,--version-script,ld.script
 PLUGIN_LDFLAGS+=-Wl,--gc-sections
 endif
 
+ifeq ($(frida_os),linux)
+LDFLAGS+=-Wl,--end-group
+endif
+
 all: ext/frida
+	rm -f src/_agent*
 ifeq ($(frida_version_major),16)
 	$(MAKE) src/r2frida-compile
 endif
@@ -171,14 +186,22 @@ IOS_CXX=xcrun --sdk iphoneos g++ $(IOS_ARCH_CFLAGS)
 .PHONY: io_frida.$(SO_EXT)
 
 # XXX we are statically linking to the .a we should use shared libs if exist
-ios: r2-sdk-ios/$(R2V)
-	rm -rf ext && $(MAKE) clean && $(MAKE) && cp -f src/r2frida-compile src/_agent.h /tmp
-	rm -rf ext && cp /tmp/_agent.h src
-	rm src/io_frida.o src/r2frida-compile
-	$(MAKE) \
-	CFLAGS="-Ir2-sdk-ios/include -Ir2-sdk-ios/include/libr -DFRIDA_VERSION_STRING=\\\"${frida_version}\\\""
-	LDFLAGS="-Lr2-sdk-ios/lib -lr -shared -fPIC" \
-	CC="$(IOS_CC)" CXX="$(IOS_CXX)" frida_os=ios frida_arch=arm64
+ios:
+	rm -rf ext
+	$(MAKE) clean && $(MAKE)
+	$(MAKE) src/_agent.h \
+		&& cp -f src/_agent.h src/_agent.h.host \
+		&& cp -f src/_agent.js src/_agent.js.host
+	$(MAKE) r2-sdk-ios/$(R2V)
+	rm -rf ext
+	rm -f src/*.o
+	$(MAKE) R2FRIDA_HOST_COMPILER=1 \
+	CFLAGS="-Ir2-sdk-ios/include -Ir2-sdk-ios/include/libr \
+	-DR2FRIDA_VERSION_STRING=\\\"${VERSION}\\\" \
+	-DFRIDA_VERSION_STRING=\\\"${frida_version}\\\"" \
+	LDFLAGS="-shared -fPIC r2-sdk-ios/lib/libr.a" \
+	HOST_CC="$(CC)" CC="$(IOS_CC)" CXX="$(IOS_CXX)" \
+	frida_os=ios frida_arch=arm64
 
 r2-sdk-ios/$(R2V):
 	rm -rf r2-sdk-ios
@@ -210,16 +233,24 @@ src/io_frida.o: src/io_frida.c $(FRIDA_SDK) src/_agent.h
 	$(CC) -c $(CFLAGS) $(FRIDA_CFLAGS) $< -o $@
 
 src/_agent.h: src/_agent.js
-	test -s src/_agent.js || ( rm -f src/_agent.js && ${MAKE} src/_agent.js)
+	test -s src/_agent.js || ( rm -f src/_agent.js && ${MAKE} src/_agent.js )
 	test -s src/_agent.js || exit 1
-	r2 -nfqcpc $< | grep 0x > $@
+	[ -f src/_agent.h ] || (echo Running r2; r2 -NNnfqcpc $< | grep 0x > $@)
 
+ifeq ($(R2FRIDA_HOST_COMPILER),1)
+src/_agent.js:
+	mv src/_agent.h.host src/_agent.h
+	mv src/_agent.js.host src/_agent.js
+	test -s src/_agent.js || rm -f src/_agent.js
+else
 src/_agent.js: src/r2frida-compile
 ifeq ($(R2FRIDA_PRECOMPILED_AGENT),1)
 	$(DLCMD) src/_agent.js $(R2FRIDA_PRECOMPILED_AGENT_URL)
 else
-	src/r2frida-compile -o src/_agent.js -Sc src/agent/index.ts
+	R2PM_OFFLINE=1 r2pm -r src/r2frida-compile -H src/_agent.h -o src/_agent.js -Sc src/agent/index.ts || \
+		src/r2frida-compile -H src/_agent.h -o src/_agent.js -Sc src/agent/index.ts
 	test -s src/_agent.js || rm -f src/_agent.js
+endif
 endif
 
 node_modules: package.json
@@ -279,8 +310,11 @@ android-arm: radare2-android-arm-libs
 		LDFLAGS="-L$(R2A_DIR)/lib $(LDFLAGS) $(PLUGIN_LDFLAGS)" SO_EXT=so
 
 clean:
-	$(RM) src/*.o src/_agent.js src/_agent.h
+	$(RM) src/*.o src/_agent.js src/_agent.h config.h
 	$(RM) -f src/r2frida-compile src/frida-compile
+	$(RM) -rf ext
+	$(RM) -f frida-sdk.tar.xz
+	$(RM) -f src/io_frida.dylib src/io_frida.so
 	$(RM) -rf $(R2A_DIR)
 
 mrproper: clean
@@ -297,14 +331,19 @@ user-install:
 	$(RM) "$(DESTDIR)/$(R2_PLUGDIR)/io_frida.$(SO_EXT)"
 	cp -f io_frida.$(SO_EXT)* $(DESTDIR)/"$(R2_PLUGDIR)"
 	cp -f src/r2frida-compile $(DESTDIR)/"$(R2PM_BINDIR)"
+	-sudo mkdir -p "$(DESTDIR)/$(PREFIX)/share/man/man1"
+	-sudo cp -f r2frida.1 "$(DESTDIR)/$(PREFIX)/share/man/man1/r2frida.1"
 
 user-uninstall:
 	$(RM) "$(DESTDIR)/$(R2_PLUGDIR)/io_frida.$(SO_EXT)"
 	$(RM) "$(DESTDIR)/$(R2PM_BINDIR)/r2frida-compile"
+	-sudo $(RM) "$(DESTDIR)/$(PREFIX)/share/man/man1/r2frida.1"
 
 user-symstall:
 	mkdir -p "$(DESTDIR)/$(R2_PLUGDIR)"
-	ln -fs $(shell pwd)/io_frida.$(SO_EXT)* $(DESTDIR)/"$(R2_PLUGDIR)"
+	ln -fs $(shell pwd)/io_frida.$(SO_EXT)* "$(DESTDIR)/$(R2_PLUGDIR)"
+	-sudo mkdir -p "$(DESTDIR)/$(PREFIX)/share/man/man1"
+	-sudo ln -fs $(shell pwd)/r2frida.1 "$(DESTDIR)/$(PREFIX)/share/man/man1/r2frida.1"
 
 # system wide
 
@@ -313,14 +352,19 @@ install:
 	cp -f io_frida.$(SO_EXT)* $(DESTDIR)/"$(R2_PLUGSYS)"
 	mkdir -p "$(DESTDIR)/$(R2_BINDIR)"
 	cp -f src/r2frida-compile $(DESTDIR)/"$(R2_BINDIR)"
+	mkdir -p "$(DESTDIR)/$(PREFIX)/share/man/man1"
+	cp -f r2frida.1 $(DESTDIR)/$(PREFIX)/share/man/man1/r2frida.1
 
 symstall:
 	mkdir -p "$(DESTDIR)/$(R2_PLUGSYS)"
 	ln -fs $(shell pwd)/io_frida.$(SO_EXT)* $(DESTDIR)/"$(R2_PLUGSYS)"
+	-mkdir -p "$(DESTDIR)/$(PREFIX)/share/man/man1"
+	-ln -fs $(shell pwd)/r2frida.1 $(DESTDIR)/$(PREFIX)/share/man/man1/r2frida.1
 
 uninstall:
 	$(RM) "$(DESTDIR)/$(R2_PLUGSYS)/io_frida.$(SO_EXT)"
 	$(RM) "$(DESTDIR)/$(R2_BINDIR)/r2frida-compile"
+	$(RM) "$(DESTDIR)/$(PREFIX)/share/man/man1/r2frida.1"
 
 release:
 	$(MAKE) android STRIP_SYMBOLS=yes
@@ -334,9 +378,9 @@ frida-sdk: ext/frida-$(frida_os)-$(frida_version)
 	cd ext && ln -fs frida-$(frida_os)-$(frida_version) frida
 
 src/r2frida-compile: src/r2frida-compile.c
-	$(CC) -g src/r2frida-compile.c $(LDFLAGS) $(FRIDA_CFLAGS) \
+	$(CC) -g src/r2frida-compile.c $(FRIDA_CFLAGS) $(R2FRIDA_COMPILE_FLAGS) \
 		$(shell pkg-config --cflags --libs r_util) $(FRIDA_LIBS) \
-		-pthread -Iext/frida -o src/r2frida-compile
+		$(CFLAGS) $(LDFLAGS) -pthread -Iext/frida -o $@
 
 ext/frida-$(frida_os)-$(frida_version):
 	@echo FRIDA_SDK=$(FRIDA_SDK)

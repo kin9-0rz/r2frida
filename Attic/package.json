@@ -29,11 +29,11 @@
   },
   "homepage": "https://github.com/viaforensics/r2frida.js",
   "devDependencies": {
-    "semistandard": "16.0.1"
+    "semistandard": "17.0.0"
   },
   "dependencies": {
     "frida": "*",
-    "r2pipe": "2.8.0",
+    "r2pipe": "2.8.6",
     "colors": "1.4.0"
   }
 }

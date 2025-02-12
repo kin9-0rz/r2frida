@@ -1,15 +1,23 @@
-/* radare2 - MIT - Copyright 2022-2023 - pancake */
+/* radare2 - MIT - Copyright 2022-2024 - pancake */
 
 #include <stdio.h>
 #include <stdbool.h>
 #include "frida-core.h"
 #include <r_util.h>
 #include <r_util/r_print.h>
+#include "../config.h"
 
+#ifdef _MSC_VER
+#undef R2__WINDOWS__
+#define R2__WINDOWS__ 1
+#endif
 
 static int on_compiler_diagnostics(void *user, GVariant *diagnostics) {
 	gchar *str = g_variant_print (diagnostics, TRUE);
-	str = r_str_replace (str, "int64", "int64:", true);
+	str = r_str_replace (str, "int64", "", true);
+	str = r_str_replace (str, "<", "", true);
+	str = r_str_replace (str, ">", "", true);
+	str = r_str_replace (str, "'", "\"", true);
 	char *json = r_print_json_indent (str, true, "  ", NULL);
 	eprintf ("%s\n", json);
 	free (json);
@@ -18,17 +26,35 @@ static int on_compiler_diagnostics(void *user, GVariant *diagnostics) {
 }
 
 static int show_help(const char *argv0, int line) {
-	printf ("Usage: %s (-hSc) [-r root] [-o output.js] [path/to/file.{js,ts}] ...\n", argv0);
+	printf ("Usage: %s (-hSc) [-H foo.h] [-r root] [-o output.js] [path/to/file.{js,ts}] ...\n", argv0);
 	if (!line) {
 		printf (
 		" -S                  Do not include source maps\n"
 		" -c                  Enable compression\n"
 		" -h                  Show this help message\n"
+		" -H [file]           Output in C-friendly hexadecimal bytes\n"
 		" -o [file]           Specify output file\n"
 		" -r [project-root]   Specify the project root directory\n"
+		" -q                  Be quiet\n"
+		" -v                  Display version\n"
 		);
 	}
 	return 1;
+}
+
+static char *to_header(const char *s) {
+	RStrBuf *sb = r_strbuf_new ("");
+	int count = 0;
+	while (*s) {
+		r_strbuf_appendf (sb, " 0x%02x,", 0xff & (*s));
+		s++;
+		count++;
+		if (count > 0 && !(count % 8)) {
+			r_strbuf_appendf (sb, "\n");
+		}
+	}
+	r_strbuf_appendf (sb, " // fin\n");
+	return r_strbuf_drain (sb);
 }
 
 int main(int argc, const char **argv) {
@@ -37,19 +63,23 @@ int main(int argc, const char **argv) {
 	int c, rc = 0;
 	GCancellable *cancellable = NULL;
 	GError *error = NULL;
-	const char *filename = "index.ts";
 	if (argc < 2) {
 		return show_help (arg0, true);
 	}
+	bool quiet = false;
+	const char *header = NULL;
 	bool source_maps = true;
 	bool compression = false;
 	RGetopt opt;
-	r_getopt_init (&opt, argc, argv, "r:Scho:");
+	r_getopt_init (&opt, argc, argv, "r:SH:cho:qv");
 	const char *proot = NULL;
 	while ((c = r_getopt_next (&opt)) != -1) {
 		switch (c) {
 		case 'r':
 			proot = opt.arg;
+			break;
+		case 'H':
+			header = opt.arg;
 			break;
 		case 'S':
 			source_maps = false;
@@ -60,8 +90,20 @@ int main(int argc, const char **argv) {
 		case 'c':
 			compression = true;
 			break;
+		case 'q':
+			quiet = true;
+			break;
 		case 'h':
 			show_help (arg0, false);
+			return 0;
+		case 'v':
+			if (quiet) {
+				printf ("%s\n", R2FRIDA_VERSION_STRING);
+			} else {
+				printf ("r2frida: %s\n", R2FRIDA_VERSION_STRING);
+				printf ("radare2: %s\n", R2_VERSION);
+				printf ("frida: %s\n", FRIDA_VERSION_STRING);
+			}
 			return 0;
 		default:
 			return show_help (arg0, false);
@@ -94,11 +136,17 @@ int main(int argc, const char **argv) {
 
 	int i;
 	bool stdin_mode = false;
+	if (argc - opt.ind > 1) {
+		R_LOG_ERROR ("Only take one file as argument");
+		return 1;
+	}
 	for (i = opt.ind; stdin_mode || i < argc; i = stdin_mode? i: i + 1) {
 		char *filename = strdup (argv[i]);
 		if (stdin_mode) {
 			fflush (stdin);
-			fgets (buf, sizeof (buf), stdin);
+			if (!fgets (buf, sizeof (buf), stdin)) {
+				break;
+			}
 			buf[sizeof (buf) -1] = 0;
 			free (filename);
 			int len = strlen (buf);
@@ -111,6 +159,10 @@ int main(int argc, const char **argv) {
 				// enter stdin mode
 				stdin_mode = true;
 				continue;
+			}
+			if (!r_str_endswith (filename, ".js") && !r_str_endswith (filename, ".ts")) {
+				R_LOG_ERROR ("The r2frida-compile only accepts .js and .ts files");
+				return 1;
 			}
 		}
 		if (R_STR_ISNOTEMPTY (proot)) {
@@ -154,6 +206,8 @@ int main(int argc, const char **argv) {
 					if (res == FALSE) {
 						R_LOG_ERROR ("Cannot write to %s", outfile);
 						rc = 1;
+					} else {
+						rc = 0;
 					}
 					CloseHandle (fh);
 				}
@@ -165,6 +219,14 @@ int main(int argc, const char **argv) {
 #endif
 			} else {
 				printf ("%s\n", slurpedData);
+			}
+			if (header) {
+				char *ns = to_header (slurpedData);
+				if (!r_file_dump (header, (const ut8*)ns, -1, false)) {
+					R_LOG_ERROR ("Cannot dump to %s", header);
+					rc = 1;
+				}
+				free (ns);
 			}
 		}
 		free (slurpedData);

@@ -1,7 +1,9 @@
 import { ObjCAvailable } from '../darwin/index.js';
 import { JavaAvailable, listJavaClassesJson } from '../java/index.js';
-import {searchInstancesJson} from '../search.js';
-import {padPointer} from '../utils.js';
+import { getPackageName } from '../java/android.js';
+import { searchInstancesJson } from '../search.js';
+import { padPointer } from '../utils.js';
+import { r2frida } from "../../plugin.js";
 
 export function listClassesLoadedJson(args: string[]) {
     if (JavaAvailable) {
@@ -210,7 +212,7 @@ export function listClassesWhere(args: string[], mode: string) {
                 if (mode === 'ivars') {
                     for (const a of ins) {
                         out += 'instance ' + padPointer(a.address) + '\n';
-                        const i = new ObjC.Object(ptr(a.address));
+                        const i = new ObjC.Object(a.address);
                         out += (JSON.stringify(i.$ivars)) + '\n';
                     }
                 }
@@ -231,6 +233,37 @@ export function listClasses(args : string[]) {
             return [padPointer(address), methodName].join(' ');
         })
         .join('\n');
+}
+
+export function listClassesHere() {
+    return listClassesHereJson().join('\n')
+}
+
+export function listClassesHereJson(): string[] {
+    const mmap = new ModuleMap();
+    const currMod = mmap.find(ptr(r2frida.offset));
+    const localClasses : string[] = [];
+
+    if (JavaAvailable) {
+        const packageName = getPackageName();
+        return listClassesJson([]).filter((klass: string) => {
+            return klass.startsWith(packageName);
+        });
+    }
+    if(ObjCAvailable && currMod) {
+        ObjC.enumerateLoadedClasses({
+            onMatch(name:string, owner:string) {
+                if(owner === currMod.path) {
+                    localClasses.push(name);
+                }
+            },
+            onComplete() {
+
+            }
+        });
+    }
+    return localClasses;
+
 }
 
 export function listClassesR2(args: string[]) {
@@ -271,7 +304,7 @@ export function listClassMethodsJson(args: string[]) {
     return listClassesJson(args, 'methods');
 }
 
-export function listClassesJson(args?: string[], mode?: string): any[] {
+export function listClassesJson(args?: string[], mode?: string): string[] {
     if (args === undefined) {
         args = [];
     }
@@ -298,7 +331,7 @@ export function listClassesJson(args?: string[], mode?: string): any[] {
         out += klassName + ': ';
         for (const i of ins) {
             out += 'instance ' + padPointer(i.address) + ': ';
-            const ii = new ObjC.Object(ptr(i.address));
+            const ii = new ObjC.Object(i.address);
             out += JSON.stringify(ii.$ivars, null, '  ');
         }
         return [out];
@@ -352,25 +385,3 @@ function _classGlob(k: string, v: string) {
     }
     return k.indexOf(v.replace(/\*/g, '')) !== -1;
 }
-
-/*
-export default {
-    listClassesLoadedJson,
-    listClassesLoaders,
-    listClassesLoaded,
-    listAllClassesNatives,
-    listClassesNatives,
-    listClassesAllMethods,
-    listClassSuperMethods,
-    listClassVariables,
-    listClassesHooks,
-    listClassesWhere,
-    listClasses,
-    listClassesR2,
-    listClassMethods,
-    listClassMethodsJson,
-    listClassesJson,
-    listProtocols,
-    listProtocolsJson
-};
-*/

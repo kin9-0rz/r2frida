@@ -5,13 +5,17 @@ declare let Swift: any;
 
 const minPrintable = ' '.charCodeAt(0);
 const maxPrintable = '~'.charCodeAt(0);
+let globalSymCounter = 0;
 
 export function sanitizeString(str: string): string {
     if (str) {
-        const specialChars = "/\\`+-${}~|*,;:\"'#@&<> ()[]!?%";
-        return str.split('').map(c => specialChars.indexOf(c) === -1 ? c : '_').join('');
+        const specialChars = "^/\\`+-${}~|*,;:\"'#@&<> ()[]!?%";
+        const nonspecial = str.split('').map(c => specialChars.indexOf(c) === -1 ? c : '_').join('');
+        return nonspecial.replace(/[\x00-\x1F\x7F]/g, "");
+    } else {
+        globalSymCounter++;
+        return 'noname.' + globalSymCounter;
     }
-    return str;
 }
 
 export function wrapStanza(name: string, stanza: any) {
@@ -21,18 +25,18 @@ export function wrapStanza(name: string, stanza: any) {
     };
 }
 
-export function hexPtr(p: UInt64 | any) {
+export function hexPtr(p: UInt64 | any): string {
     if (p instanceof UInt64) {
         return `0x${p.toString(16)}`;
     }
     return p.toString();
 }
 
-export function ptrMax(a: NativePointer, b: NativePointer) {
+export function ptrMax(a: NativePointer, b: NativePointer): NativePointer {
     return a.compare(b) > 0 ? a : b;
 }
 
-export function ptrMin(a: NativePointer, b: NativePointer) {
+export function ptrMin(a: NativePointer, b: NativePointer): NativePointer {
     return a.compare(b) < 0 ? a : b;
 }
 
@@ -58,12 +62,12 @@ export function toWidePairs(raw: string): string {
     return pairs.join(' ');
 }
 
-export function normHexPairs(raw: string) {
+export function normHexPairs(raw: string) : string | null {
     const norm = raw.replace(/ /g, '');
     if (_isHex(norm)) {
         return _toPairs(norm.replace(/\./g, '?'));
     }
-    throw new Error('Invalid hex string');
+    return null;
 }
 
 export function filterPrintable(arr: any) {
@@ -91,13 +95,13 @@ export function byteArrayToHex(arr: any) {
     return hexs.join('');
 }
 
-export function renderEndian(value: NativePointer, bigEndian: boolean, width: number) {
+export function renderEndian(value: NativePointer, bigEndian: boolean, width: number): NativePointer[] {
     const bytes = [];
     for (let i = 0; i !== width; i++) {
         if (bigEndian) {
-            bytes.push(value.shr((width - i - 1) * 8).and(0xff).toUInt32());
+            bytes.push(value.shr((width - i - 1)).and(0xff));
         } else {
-            bytes.push(value.shr(i * 8).and(0xff).toUInt32());
+            bytes.push(value.shr(i).and(0xff));
         }
     }
     return bytes;
@@ -111,9 +115,9 @@ export function padString(text: string, length: number) {
 
 export function padPointer(value: string | NativePointer) {
     if (value.toString().indexOf('ArrayBuffer') !== -1) {
-        value = arrayBufferToHex(value);
+        value = arrayBufferToHex(value).toString();
     }
-    let result = (+value).toString(16);
+    let result = (new NativePointer(value)).toString(16);
     const paddedLength = 2 * Process.pointerSize;
     while (result.length < paddedLength) {
         result = '0' + result;
@@ -121,13 +125,14 @@ export function padPointer(value: string | NativePointer) {
     return '0x' + result;
 }
 
-function _toPairs(hex: string): string {
+function _toPairs(hex: string): string | null {
     if ((hex.length % 2) !== 0) {
-        throw new Error('Odd-length string');
+        return null;
+        // throw new Error('Odd-length string');
     }
-    const pairs = [];
+    const pairs : string[] = [];
     for (let i = 0; i !== hex.length; i += 2) {
-        pairs.push(hex.substring(i, 2));
+        pairs.push(hex.substring(i, i + 2));
     }
     return pairs.join(' ').toLowerCase();
 }
@@ -147,9 +152,9 @@ export function trunc4k(x: NativePointer) {
 
 export function rwxstr(x: number): string {
     let str = '';
-    str += (x & 1) ? 'r' : '-';
+    str += (x & 4) ? 'r' : '-';
     str += (x & 2) ? 'w' : '-';
-    str += (x & 4) ? 'x' : '-';
+    str += (x & 1) ? 'x' : '-';
     return str;
 }
 

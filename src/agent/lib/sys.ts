@@ -3,7 +3,6 @@ import { exist, transformVirtualPath } from './fs.js';
 // TODO: add proper Function<> type for each :any here
 export let _getenv: any | null = null;
 export let _setenv: any | null = null;
-export let _getpid: any | null = null;
 export let _getuid: any | null = null;
 export let _dup2: any | null = null;
 export let _readlink: any | null = null;
@@ -14,7 +13,6 @@ export let _kill: any | null = null;
 if (Process.platform === 'windows') {
     _getenv = sym('getenv', 'pointer', ['pointer']);
     _setenv = sym('SetEnvironmentVariableA', 'int', ['pointer', 'pointer']);
-    _getpid = sym('_getpid', 'int', []);
     _getuid = getWindowsUserNameA;
     _dup2 = sym('_dup2', 'int', ['int', 'int']);
     _fstat = sym('_fstat', 'int', ['int', 'pointer']);
@@ -23,7 +21,6 @@ if (Process.platform === 'windows') {
 } else {
     _getenv = sym('getenv', 'pointer', ['pointer']);
     _setenv = sym('setenv', 'int', ['pointer', 'pointer', 'int']);
-    _getpid = sym('getpid', 'int', []);
     _getuid = sym('getuid', 'int', []);
     _dup2 = sym('dup2', 'int', ['int', 'int']);
     _readlink = sym('readlink', 'int', ['pointer', 'pointer', 'int']);
@@ -36,7 +33,7 @@ export function sym(name: string, ret: NativeFunctionReturnType, arg: NativeFunc
     try {
         return new NativeFunction(Module.getExportByName(null, name), ret, arg);
     } catch (e) {
-        console.error(name, ':', e);
+        return null;
     }
 }
 
@@ -44,7 +41,7 @@ export function symf(name: string, ret: NativeFunctionReturnType, arg: NativeFun
     try {
         return new SystemFunction(Module.getExportByName(null, name), ret, arg);
     } catch (e) {
-        // console.error('Warning', name, ':', e);
+        return null;
     }
 }
 
@@ -61,22 +58,23 @@ export function getWindowsUserNameA() {
 }
 
 export function getPidJson(): any {
-    return JSON.stringify({ pid: getPid() });
+    return JSON.stringify({ pid: Process.id });
 }
 
 export function getPid(): number {
-    if (_getpid !== null) {
-        return _getpid();
-    }
-    return -1;
+    return Process.id;
 }
 
 export function getOrSetEnv(args: string[]) {
     if (args.length === 0) {
-        return getEnv()!.join('\n') + '\n';
+        const environment = getEnv();
+	if (environment === null) {
+            return "";
+	}
+        return environment.join('\n');
     }
-    const { key, value } = getOrSetEnvJson(args);
-    return key + '=' + value;
+    const { value } = getOrSetEnvJson(args);
+    return (args[0].indexOf("=") === -1)? value: "";
 }
 
 function getOrSetEnvJson(args: string[]): any {
@@ -93,31 +91,37 @@ function getOrSetEnvJson(args: string[]): any {
             key: k,
             value: v
         };
-    } else {
-        return {
-            key: kv,
-            value: getenv(kv)
-        };
     }
+    return {
+        key: kv,
+        value: getenv(kv)
+    };
 }
 
 function getEnv(): string[] | null {
     const result: any = [];
     const enva = Module.findExportByName(null, 'environ');
-    if (enva === null) {
+    if (enva === null || enva.isNull()) {
         return null;
     }
     let envp = enva.readPointer();
-    let env;
-    while (!envp.isNull() && !(env = envp.readPointer()).isNull()) {
+    while (!envp.isNull()) {
+	const env = envp.readPointer();
+	if (env.isNull()) {
+            break;
+	}
         result.push(env.readCString());
         envp = envp.add(Process.pointerSize);
     }
-    return result.join("\n");
+    return result;
 }
 
 function getEnvJson() {
-    return getEnv()!.map(kv => {
+    const environment = getEnv();
+    if (environment === null) {
+        return {};
+    }
+    return environment.map(kv => {
         const eq = kv.indexOf('=');
         return {
             key: kv.substring(0, eq),
@@ -127,6 +131,9 @@ function getEnvJson() {
 }
 
 export function dlopen(args: string[]) {
+    if (args.length < 1) {
+        return "Usage: dl [path]";
+    }
     const path = transformVirtualPath(args[0]);
     if (exist(path)) {
         return Module.load(path);
@@ -167,7 +174,6 @@ export function changeSelinuxContext(args: string[]) {
 export default {
     sym,
     symf,
-    _getpid,
     _getuid,
     _dup2,
     _readlink,

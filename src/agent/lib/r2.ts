@@ -1,4 +1,4 @@
-import { sym } from './sys.js';
+import { sym, getenv } from './sys.js';
 import { wrapStanza, getPtr } from './utils.js';
 
 type CommandFunction = () => void;
@@ -24,22 +24,17 @@ export function getArch(arch: string): string {
     return arch;
 }
 
-export function hostCmds(commands: string[]): any {
-    let i = 0;
-    function sendOne(): any {
-        if (i < commands.length) {
-            return hostCmd(commands[i]).then(() => {
-                i++;
-                return sendOne();
-            });
-        } else {
-            return Promise.resolve();
-        }
+export async function hostCmds(commands: string[]): Promise<string[]> {
+    let allPromises = [];
+    for (let i=0; i<commands.length; i++) {
+        allPromises.push(hostCmd(commands[i]));
     }
-    return sendOne();
+    const results = await Promise.allSettled(allPromises) as {status: 'fulfilled' | 'rejected', value: string}[];
+    const succeeded = results.filter(o => o.status === "fulfilled").map(e => e.value);
+    return succeeded;
 }
 
-export function hostCmd(cmd: string) {
+export async function hostCmd(cmd: string): Promise<string> {
     return new Promise((resolve) => {
         const serial = cmdSerial;
         cmdSerial++;
@@ -48,11 +43,9 @@ export function hostCmd(cmd: string) {
     });
 }
 
-export function hostCmdj(cmd: string): any {
-    return hostCmd(cmd)
-        .then((output: any) => {
-            return JSON.parse(output);
-        });
+export async function hostCmdj(cmd: string): Promise<JSON> {
+    const output = await hostCmd(cmd);
+    return JSON.parse(output);
 }
 
 export function onCmdResp(params: any) {
@@ -76,7 +69,7 @@ export function onCmdResp(params: any) {
     return [{}, null];
 }
 
-function _sendCommand(cmd: string, serial: number) {
+function _sendCommand(cmd: string, serial: number): void {
     function sendIt() {
         sendingCommand = true;
         send(wrapStanza('cmd', {
@@ -120,7 +113,12 @@ function _radareCommandInit(): boolean {
         _r_core_cmd_str = sym('r_core_cmd_str', 'pointer', ['pointer', 'pointer']);
         _r_core_free = sym('r_core_free', 'void', ['pointer']);
         _free = sym('free', 'void', ['pointer']);
-        _r2 = _r_core_new();
+        const cpstr = getenv("R2CORE");
+        if (cpstr !== null) {
+          _r2 = ptr(cpstr);
+        } else {
+          _r2 = _r_core_new();
+        }
     }
     return true;
 }
@@ -137,6 +135,35 @@ function _radareCommandString(cmd: string): string {
     return '';
 }
 
+export interface r2Config {
+    search: r2SearchConfig,
+    cfg: r2Cfg
+}
+
+export interface r2Cfg {
+    bigendian: boolean;
+}
+
+export interface r2SearchConfig {
+    align: string;
+    badpages: string;
+    chunk: string;
+    contiguous: string;
+    distance: string;
+    esilcombo: string;
+    flags: string;
+    kwidx: number;
+    maxhits: string;
+    named: string;
+    overlap: string;
+    prefix: string;
+    show: string;
+    from: string;
+    to: string;
+    verbose: string;
+    count: number;
+}
+
 export default {
     getArch,
     hostCmds,
@@ -144,5 +171,5 @@ export default {
     hostCmdj,
     onCmdResp,
     seek,
-    cmd
+    cmd,
 };

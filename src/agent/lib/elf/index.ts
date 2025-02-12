@@ -1,5 +1,5 @@
 import * as utils from '../utils.js';
-import { dynamicEntries, dynamicTags, ELF_HEADER, EM_AARCH64 } from './elf_h.js';
+import { dynamicEntries, dynamicTags, ELF_HEADER, EM_AARCH64, EM_X86_64 } from './elf_h.js';
 
 class Section {
     name: string;
@@ -33,6 +33,7 @@ function listElfSections(baseAddr: NativePointer) {
             return parseSectionHeaders(baseAddr, segment.vmaddr, segment.vmsize, segments);
         }
     }
+    return [];
 }
 
 function _isElfHeaderAtOffset(offset: NativePointer) : boolean {
@@ -59,15 +60,18 @@ function parseSectionHeaders(baseAddr: NativePointer, PTDynamicAddr: NativePoint
         cursor = cursor.add(16);
     }
     // HASH Section
+    let nchain = 0;
     const hashTablePtr = dynamicEntries[dynamicTags.DT_HASH].value;
-    const nbucket = hashTablePtr.readU32();
-    const nchain = hashTablePtr.add(4).readU32();
-    sections.push(new Section(
-        dynamicEntries[dynamicTags.DT_HASH].name,
-        hashTablePtr,
-        (nbucket * 4) + (nchain * 4) + 8,
-        JSON.stringify(utils.belongsTo(segments, hashTablePtr).map((x:any) => x.perm))
-    ));
+    if (hashTablePtr) {
+        const nbucket = hashTablePtr.readU32();
+        nchain = hashTablePtr.add(4).readU32();
+        sections.push(new Section(
+            dynamicEntries[dynamicTags.DT_HASH].name,
+            hashTablePtr,
+            (nbucket * 4) + (nchain * 4) + 8,
+            JSON.stringify(utils.belongsTo(segments, hashTablePtr).map((x:any) => x.perm))
+        ));
+    }
     // STRTAB Section
     sections.push(new Section(
         dynamicEntries[dynamicTags.DT_STRTAB].name,
@@ -182,7 +186,7 @@ function parseHeaderType(value: number) : string | null {
     return null;
 }
 
-function parseElfHeader(offset: NativePointer) {
+function parseElfHeader(offset: NativePointer) : any {
     const header = {
         magic: offset.readU32(),
         class: offset.add(0x4).readU8(),
@@ -202,12 +206,15 @@ function parseElfHeader(offset: NativePointer) {
         shNum: offset.add(0x3c).readU16(),
         shrStrndx: offset.add(0x3e).readU16()
     };
-    if (header.machine === EM_AARCH64) {
+    switch (header.machine) {
+    case EM_AARCH64:
+    case EM_X86_64:
         return header;
     }
-    throw new Error('Only support for 64-bit apps');
+    throw new Error('Only works on 64-bit arm/intel apps');
 }
 
 export { listElfSections };
 export { listElfSegments };
+export { parseElfHeader };
 export default { listElfSections, listElfSegments };

@@ -43,6 +43,7 @@ export function traceFormat(args: any) {
     const traceOnEnter = format.indexOf('^') !== -1;
     const traceBacktrace = format.indexOf('+') !== -1;
     const useCmd = config.getString('hook.usecmd');
+    const useTimestamp = config.getBoolean('hook.time');
     const currentModule = getModuleByAddress(ptr(address));
     const listener = Interceptor.attach(ptr(address), {
         onEnter(this: any, args: any): void {
@@ -58,21 +59,22 @@ export function traceFormat(args: any) {
                 this.myBacktrace = Thread.backtrace(this.context).map(DebugSymbol.fromAddress);
             }
             if (traceOnEnter) {
-                const traceMessage :any = {
+                const traceMessage: any = {
                     source: 'dtf',
                     name: name,
                     address: address,
                     timestamp: new Date(),
                     values: this.myArgs
                 };
-                if (config.getBoolean('hook.backtrace')) {
+                if (config.getBoolean('hook.backtrace') || this.myBacktrace != undefined) {
                     traceMessage.backtrace = Thread.backtrace(this.context).map(DebugSymbol.fromAddress);
                 }
                 if (config.getString('hook.output') === 'json') {
                     log.traceEmit(JSON.stringify(traceMessage));
                 } else {
-                    let msg = `[dtf onEnter][${traceMessage.timestamp}] ${name}@${address} - args: ${this.myArgs.join(', ')}`;
-                    if (config.getBoolean('hook.backtrace')) {
+                    const tss = useTimestamp? `[${traceMessage.timestamp}]`: "";
+                    let msg = `[dtf onEnter]${tss} ${name}@${address} - args: ${this.myArgs.join(', ')}`;
+                    if (config.getBoolean('hook.backtrace') || this.myBacktrace != undefined) {
                         msg += ` backtrace: ${traceMessage.backtrace.toString()}`;
                     }
                     for (let i = 0; i < this.myDumps.length; i++) {
@@ -85,13 +87,13 @@ export function traceFormat(args: any) {
                 }
             }
         },
-        onLeave(this:any, retval: InvocationReturnValue): void {
+        onLeave(this: any, retval: InvocationReturnValue): void {
             if (!traceOnEnter) {
                 const fmtArgs = _formatArgs(this.keepArgs, format);
                 const fmtRet = _formatRetval(retval, format);
                 this.myArgs = fmtArgs.args;
                 this.myDumps = fmtArgs.dumps;
-                const traceMessage : any = {
+                const traceMessage: any = {
                     source: 'dtf',
                     name: name,
                     address: address,
@@ -105,7 +107,8 @@ export function traceFormat(args: any) {
                 if (config.getString('hook.output') === 'json') {
                     log.traceEmit(JSON.stringify(traceMessage));
                 } else {
-                    let msg = `[dtf onLeave][${traceMessage.timestamp}] ${name}@${address} - args: ${this.myArgs.join(', ')}. Retval: ${fmtRet}`;
+                    const tss = useTimestamp? `[${traceMessage.timestamp}]`: "";
+                    let msg = `[dtf onLeave]${tss} ${name}@${address} - args: ${this.myArgs.join(', ')}. Retval: ${fmtRet}`;
                     if (config.getBoolean('hook.backtrace')) {
                         msg += ` backtrace: ${traceMessage.backtrace.toString()}`;
                     }
@@ -234,64 +237,114 @@ export function traceRegs(args: string[]) {
     if (haveTraceAt(address)) {
         return "There's already a trace in here";
     }
-    const context: any = {};
-    const rest = args.slice(1);
+    //const context: any;
+    const registers = args.slice(1);
     const currentModule = getModuleByAddress(address);
-    const listener = Interceptor.attach(address, traceFunction);
-    function traceFunction(_: any) {
-        traceListener.hits++;
-        const regState: any = {};
-        rest.forEach((r) => {
-            let regName = r;
-            let regValue = "" 
-            if (r.indexOf('=') !== -1) {
-                const kv = r.split('=');
-                context[kv[0]] = ptr(kv[1]); // set register value
-                regName = kv[0];
-                regValue = kv[1];
-            } else {
+    const useTimestamp = config.getBoolean('hook.time');
+    const listener = Interceptor.attach(address, {
+        onEnter() {
+            const context: CpuContext = this.context;
+            traceListener.hits++;
+            const regState: any = {};
+            registers.forEach((r) => {
+                if (r[0] === '%') {
+                    return;
+                }
+                let regName = "", regValue = "";
+                regName = r;
+                // set a new register value
+                if (r.indexOf('=') !== -1) {
+                    [regName, regValue] = r.split('=');
+                    context[regName as keyof CpuContext] = ptr(regValue);
+                }
                 try {
-                    const rv = ptr(context[r]);
-                    regValue = rv.toString();
-                    let tail = rv.readCString();
+                    regValue = context[r as keyof CpuContext].toString();
+                    let tail = context[r as keyof CpuContext].readUtf8String();
                     if (tail) {
-                        tail = ' (' + tail + ')';
-                        regValue += tail;
+                        regValue += ' (' + tail + ')';
                     }
                 } catch (e: any) {
                     // do nothing
                 }
-            }
-            regState[regName] = regValue;
-        });
-        const traceMessage = {
-            source: 'dtr',
-            address: address,
-            timestamp: new Date(),
-            values: regState,
-            backtrace: [] as any[]
-        };
-        if (config.getBoolean('hook.backtrace')) {
-            traceMessage.backtrace = Thread.backtrace(context).map(DebugSymbol.fromAddress);
-        }
-        if (config.getString('hook.output') === "json") {
-            log.traceEmit(JSON.stringify(traceMessage));
-        } else {
-            let msg = `[dtr][${traceMessage.timestamp}] ${address} - registers: ${JSON.stringify(regState)}`;
+                regState[regName] = regValue;
+            });
+            const traceMessage = {
+                source: 'dtr',
+                address: address,
+                timestamp: new Date(),
+                values: regState,
+                backtrace: [] as any[]
+            };
             if (config.getBoolean('hook.backtrace')) {
-                msg += ` backtrace: ${traceMessage.backtrace.toString()}`;
+                traceMessage.backtrace = Thread.backtrace(context).map(DebugSymbol.fromAddress);
             }
-            log.traceEmit(msg);
+            if (config.getString('hook.output') === "json") {
+                log.traceEmit(JSON.stringify(traceMessage));
+            } else {
+                let msg = `[dtr][${traceMessage.timestamp}] ${address} - registers: ${JSON.stringify(regState)}`;
+                if (config.getBoolean('hook.backtrace')) {
+                    msg += ` backtrace: ${traceMessage.backtrace.toString()}`;
+                }
+                log.traceEmit(msg);
+            }
+        },
+        onLeave() {
+            const context: CpuContext = this.context;
+            traceListener.hits++;
+            const regState: any = {};
+            registers.forEach((r) => {
+                if (r[0] !== '%') {
+                    return;
+                }
+                r = r.slice(1); // Removes the Token %
+                let regName = "", regValue = "";
+                regName = r;
+                // set a new register value
+                if (r.indexOf('=') !== -1) {
+                    [regName, regValue] = r.split('=');
+                    context[regName as keyof CpuContext] = ptr(regValue);
+                }
+                try {
+                    regValue = context[r as keyof CpuContext].toString();
+                    let tail = context[r as keyof CpuContext].readUtf8String();
+                    if (tail) {
+                        regValue += ' (' + tail + ')';
+                    }
+                } catch (e: any) {
+                    // do nothing
+                }
+                regState[regName] = regValue;
+            });
+            const traceMessage = {
+                source: 'dtr',
+                address: address,
+                timestamp: new Date(),
+                values: regState,
+                backtrace: [] as any[]
+            };
+            if (config.getBoolean('hook.backtrace')) {
+                traceMessage.backtrace = Thread.backtrace(context).map(DebugSymbol.fromAddress);
+            }
+            if (config.getString('hook.output') === "json") {
+                log.traceEmit(JSON.stringify(traceMessage));
+            } else {
+                const tss = useTimestamp? `[${traceMessage.timestamp}]`: "";
+                let msg = `[dtr](onLeave)${tss} ${address} - registers: ${JSON.stringify(regState)}`;
+                if (config.getBoolean('hook.backtrace')) {
+                    msg += ` backtrace: ${traceMessage.backtrace.toString()}`;
+                }
+                log.traceEmit(msg);
+            }
         }
-    }
+    });
     const traceListener = {
         source: 'dtr',
         hits: 0,
         at: address,
         moduleName: currentModule ? currentModule.name : 'unknown',
-        name: args[0],
+        name:args[0],
         listener: listener,
-        args: rest
+        args: registers
     };
     traceListeners.push(traceListener);
     return '';
@@ -338,7 +391,7 @@ export function traceReal(name: string, addressString?: string) {
     const currentModule = getModuleByAddress(address);
     const listener = Interceptor.attach(address, (args: any) => {
         const values = tracehook(address, args);
-        const traceMessage :any = {
+        const traceMessage: any = {
             source: 'dt',
             address: address,
             timestamp: new Date(),
@@ -348,7 +401,9 @@ export function traceReal(name: string, addressString?: string) {
         if (config.getString('hook.output') === 'json') {
             log.traceEmit(JSON.stringify(traceMessage));
         } else {
-            log.traceEmit(`[dt][${traceMessage.timestamp}] ${address} - args: ${JSON.stringify(values)}`);
+            const useTimestamp = config.getBoolean('hook.time');
+            const tss = useTimestamp? `[${traceMessage.timestamp}]`: "";
+            log.traceEmit(`[dt]${tss} ${address} - args: ${JSON.stringify(values)}`);
         }
     });
     const traceListener = {
@@ -418,7 +473,7 @@ export function traceLogDumpR2() {
         const binput = Uint8Array.from(input.split('').map((x) => { return x.charCodeAt(0); }));
         const bytes = Uint8Array.from(binput);
         const data = fromByteArray(bytes);
-        res += `T base64: ${data} \n`;
+        res += `T base64:${data} \n`;
         if (l.script) {
             res += l.script;
         }
@@ -572,7 +627,7 @@ function _format(addr: NativePointer, fmt: string) {
         case 'O':
             if (ObjC.available) {
                 if (!addr.isNull()) {
-                    if (darwin.isObjC(addr)) {
+                    if (darwin.isValidObjC(addr)) {
                         const o = new ObjC.Object(addr);
                         if (o.$className === 'Foundation.__NSSwiftData') {
                             result = `${o.$className}: "${ObjC.classes.NSString.alloc().initWithData_encoding_(o, 4).toString()}"`;
@@ -647,7 +702,7 @@ function _hexdumpUntrusted(addr: NativePointer, len: number) {
     }
 }
 
-function _tracelogToString(l:any) {
+function _tracelogToString(l: any) {
     const line = [l.source, l.name || l.address, _objectToString(l.values)].join('\t');
     const bt = (!l.backtrace)
         ? ''
@@ -656,12 +711,12 @@ function _tracelogToString(l:any) {
         }).join('\n') + '\n';
     return line + bt;
 }
-function _objectToString(o:any) {
+function _objectToString(o: any) {
     // console.error(JSON.stringify(o));
     const r = Object.keys(o).map((k) => {
         try {
             const p = ptr(o[k]);
-            if (darwin.isObjC(p)) {
+            if (darwin.isValidObjC(p)) {
                 const o = new ObjC.Object(p);
                 return k + ': ' + o.toString();
             }

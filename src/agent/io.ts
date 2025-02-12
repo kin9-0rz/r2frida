@@ -11,24 +11,36 @@ function invalidateCachedRanges() {
     Script.nextTick(() => { cachedRanges = [] ; });
 }
 
-export function read(params: any) {
-    const { offset, count, fast } = params;
+export function read(params: R2FIOReadParameters) {
+    const { offset, count } = params;
+    const fast = false;
     if (typeof r2frida.hookedRead === 'function') {
         return r2frida.hookedRead(offset, count);
     }
-    if (r2frida.safeio) {
+    if (config.getBoolean('io.volatile')) {
+        const np = new NativePointer(offset) as any;
+	try {
+          const data = np.readVolatile(count);
+          return [{}, data];
+	} catch(err) {
+	  // config.set("io.volatile", false);
+	}
+        return [{}, []];
+    }
+
+    const o = ptr(offset);
+    if (config.getBoolean('io.safe')) {
         try {
             if (cachedRanges.length === 0) {
                 const foo = (map: RangeDetails) : PointerPair => [map.base, map.base.add(map.size)];
                 cachedRanges = Process.enumerateRanges('').map(foo);
             }
-            const o = ptr(offset);
             for (const map of cachedRanges) {
                 if (o.compare(map[0]) >= 0 && o.compare(map[1]) < 0) {
                     let left = count;
                     if (o.add(count).compare(map[1]) > 0) {
                         const rest = o.add(count).sub(map[1]);
-                        left = left.sub(rest);
+                        left = left - rest.toUInt32();
                     }
                     const bytes = o.readByteArray(left);
                     return [{}, (bytes !== null) ? bytes : []];
@@ -36,10 +48,10 @@ export function read(params: any) {
             }
             return [{}, []];
         } catch (e) {
-            console.error('safeio-read', e);
+            // console.error('safeio-read', e);
         }
     }
-    if (offset < 0) {
+    if (o.compare(2) < 0) {
         return [{}, []];
     }
     try {
@@ -65,13 +77,27 @@ export function read(params: any) {
     return [{}, []];
 }
 
+function isWriteable(address: NativePointer) : boolean {
+    const currentRange = Process.getRangeByAddress(address);
+    return currentRange.protection.indexOf('w') !== -1;
+}
+
 function isExecutable(address: NativePointer) : boolean {
     const currentRange = Process.getRangeByAddress(address);
     return currentRange.protection.indexOf('x') !== -1;
 }
 
-export function write(params: any, data: any) {
-    const ptroff = params.offset;
+interface R2FIOWriteParameters {
+	offset: string;
+}
+interface R2FIOReadParameters {
+	offset: string;
+	count: number;
+	fast: boolean;
+}
+
+export function write(params: R2FIOWriteParameters, data: any) {
+    const ptroff = ptr(params.offset);
     if (typeof r2frida.hookedWrite === 'function') {
         return r2frida.hookedWrite(ptroff, data);
     }
@@ -81,10 +107,13 @@ export function write(params: any, data: any) {
                 p.writeByteArray(data);
             });
         } else {
-            params.offset.writeByteArray(data);
+            ptroff.writeByteArray(data);
         }
     } else {
-        params.offset.writeByteArray(data);
+        if (!isWriteable(ptroff)) {
+            console.error(`ERROR: The page at ${ptroff} is not writeable. Run ':dmp ${ptroff} 4096 rwx' to fix that error.`);
+        }
+        ptroff.writeByteArray(data);
     }
     return [{}, null];
 }

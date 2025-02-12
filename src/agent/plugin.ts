@@ -38,7 +38,6 @@ export type PutsFunction = (s: string) => void;
 // import packageJson from "./package.json" assert { type: "json" };
 export interface R2FridaPlugin {
     version: string,
-    safeio: boolean,
     commandHandler: any,
     pluginRegister: any,
     pluginUnregister: any,
@@ -50,27 +49,17 @@ export interface R2FridaPlugin {
     offset: string,
     logs: string[],
     hostCmd: any,
+    hostCmds: any,
     hostCmdj: any,
+    cmd: any,
     log: any,
     emit: any,
     module: string,
     puts: PutsFunction | null,
 }
 
-/*
-r2frida.hostCmd = r2.hostCmd;
-r2frida.hostCmdj = r2.hostCmdj;
-r2frida.logs = log.logs;
-r2frida.log = log.traceLog;
-r2frida.emit = log.traceEmit;
-r2frida.safeio = NeedsSafeIo;
-r2frida.module = '';
-r2frida.puts = initializePuts();
-*/
-
 export const r2frida: R2FridaPlugin = {
-    version: "5.8.2",
-    safeio: false,
+    version: "5.9.8",
     commandHandler: commandHandler,
     pluginRegister: pluginRegister,
     pluginUnregister: pluginUnregister,
@@ -83,11 +72,13 @@ export const r2frida: R2FridaPlugin = {
     offset: "",
     logs: [],
     hostCmd: undefined,
+    hostCmds: undefined,
     hostCmdj: undefined,
     log: undefined,
     emit: undefined,
     module: "",
-    puts: null 
+    puts: null,
+    cmd: undefined,
 };
 
 // dont do this global, we can export and use the r2frida object

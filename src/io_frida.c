@@ -1,4 +1,4 @@
-/* radare2 - MIT - Copyright 2016-2023 - pancake, oleavr, mrmacete */
+/* radare2 - MIT - Copyright 2016-2024 - pancake, oleavr, mrmacete, murphy */
 
 #define R_LOG_ORIGIN "r2frida"
 
@@ -14,9 +14,9 @@
 #endif
 
 typedef struct {
-	const char * cmd_string;
+	const char *cmd_string;
 	ut64 serial;
-	JsonObject * _cmd_json;
+	JsonObject *_cmd_json;
 } RFPendingCmd;
 
 typedef struct {
@@ -53,6 +53,8 @@ typedef struct {
 	gulong onmsg_handler;
 	gulong ondtc_handler;
 	FridaDeviceManager *device_manager;
+	RStrBuf *sb;
+	bool inputmode;
 } RIOFrida;
 
 typedef enum {
@@ -69,6 +71,7 @@ static bool resolve_target(RIOFrida *rf, const char *pathname, R2FridaLaunchOpti
 static bool resolve_device(RIOFrida *rf, const char *device_id, FridaDevice **device, GCancellable *cancellable);
 static bool resolve_process(FridaDevice *device, R2FridaLaunchOptions *lo, GCancellable *cancellable);
 static JsonBuilder *build_request(const char *type);
+static void add_offset_parameter(JsonBuilder *builder, ut64 off);
 static JsonObject *perform_request(RIOFrida *rf, JsonBuilder *builder, GBytes *data, GBytes **bytes);
 static RFPendingCmd * pending_cmd_create(JsonObject * cmd_json);
 static void pending_cmd_free(RFPendingCmd * pending_cmd);
@@ -100,8 +103,8 @@ static const char * const helpmsg = ""\
 	"* device = '' | host:port | device-id\n"
 	"* target = pid | appname | process-name | program-in-path | abspath\n"
 	"Local:\n"
+	"* frida://                         # visual mode to select action+device+program\n"
 	"* frida://?                        # show this help\n"
-	"* frida://                         # list local processes\n"
 	"* frida://0                        # attach to frida-helper (no spawn needed)\n"
 	"* frida:///usr/local/bin/rax2      # abspath to spawn\n"
 	"* frida://rax2                     # same as above, considering local/bin is in PATH\n"
@@ -116,6 +119,9 @@ static const char * const helpmsg = ""\
 	"Remote:\n"
 	"* frida://attach/remote/10.0.0.3:9999/558 # attach to pid 558 on tcp remote frida-server\n"
 	"Environment: (Use the `%` command to change the environment at runtime)\n"
+	"  R2FRIDA_R2SCRIPT=~/.r2fridarc\n"
+	"  R2FRIDA_SCRIPTS_DIR="R2_DATDIR"/r2frida/scripts\n"
+	"  R2FRIDA_SCRIPTS_DIR=~/.local/share/radare2/r2frida/scripts\n"
 	"  R2FRIDA_SAFE_IO=0|1              # Workaround a Frida bug on Android/thumb\n"
 	"  R2FRIDA_DEBUG=0|1                # Used to trace internal r2frida C and JS calls\n"
 	"  R2FRIDA_RUNTIME=qjs|v8           # Select the javascript engine to use in the agent side (v8 is default)\n"
@@ -185,6 +191,7 @@ static RIOFrida *r_io_frida_new(RIO *io) {
 
 	rf->cancellable = g_cancellable_new (); // TODO: call cancel() when shutting down
 	rf->s = r_socket_new (false);
+	rf->sb = r_strbuf_new ("");
 	rf->detached = false;
 	rf->detach_reason = 0;
 	rf->io = io;
@@ -240,6 +247,7 @@ static void r_io_frida_free(RIOFrida *rf) {
 	}
 	r_socket_free (rf->s);
 	free (rf->crash_report);
+	r_strbuf_free (rf->sb);
 	g_clear_object (&rf->crash);
 	g_clear_object (&rf->script);
 	g_clear_object (&rf->session);
@@ -290,8 +298,9 @@ static bool __check(RIO *io, const char *pathname, bool many) {
 }
 
 static bool user_wants_safe_io(FridaDevice *device) {
+	bool SAFE_IO_required = false;
+#if 0
 	/* Requesting safe_io on iOS15 until https://github.com/frida/frida-gum/commit/72c5c84a424e40336489ee0624e46a7ff31807b8 */
-	bool isIOS15 = false;
 	GError *error = NULL;
 	GHashTable * params;
 	GVariant * os;
@@ -301,10 +310,11 @@ static bool user_wants_safe_io(FridaDevice *device) {
 		os = g_hash_table_lookup (params, "os");
 		g_variant_lookup (os, "version", "s", &version);
 		g_hash_table_unref (params);
-		isIOS15 = r_str_startswith(version, "15");
+		SAFE_IO_required = r_str_startswith(version, "15") || r_str_startswith(version, "16");
 		g_free (version);
 	}
-	return r_sys_getenv_asbool ("R2FRIDA_SAFE_IO") || isIOS15;
+#endif
+	return r_sys_getenv_asbool ("R2FRIDA_SAFE_IO") || SAFE_IO_required;
 }
 
 static bool __close(RIODesc *fd) {
@@ -332,10 +342,11 @@ static int __read(RIO *io, RIODesc *fd, ut8 *buf, int count) {
 	RIOFrida *rf = fd->data;
 
 	JsonBuilder *builder = build_request ("read");
-	json_builder_set_member_name (builder, "offset");
-	json_builder_add_int_value (builder, io->off);
+	add_offset_parameter (builder, io->off);
 	json_builder_set_member_name (builder, "count");
 	json_builder_add_int_value (builder, count);
+	json_builder_set_member_name (builder, "fast");
+	json_builder_add_boolean_value (builder, false);
 
 	JsonObject *result = perform_request (rf, builder, NULL, &bytes);
 	if (!result) {
@@ -381,7 +392,10 @@ static bool __eternalizeScript(RIOFrida *rf, const char *fileName) {
 
 static int on_compiler_diagnostics (void *user, GVariant *diagnostics) {
 	gchar *str = g_variant_print (diagnostics, TRUE);
-	str = r_str_replace (str, "int64", "int64:", true);
+	str = r_str_replace (str, "int64", "", true);
+	str = r_str_replace (str, "<", "", true);
+	str = r_str_replace (str, ">", "", true);
+	str = r_str_replace (str, "'", "\"", true);
 	char *json = r_print_json_indent (str, true, "  ", NULL);
 	eprintf ("%s\n", json);
 	free (json);
@@ -414,8 +428,7 @@ static int __write(RIO *io, RIODesc *fd, const ut8 *buf, int count) {
 	RIOFrida *rf = fd->data;
 
 	JsonBuilder *builder = build_request ("write");
-	json_builder_set_member_name (builder, "offset");
-	json_builder_add_int_value (builder, io->off);
+	add_offset_parameter (builder, io->off);
 
 	JsonObject *result = perform_request (rf, builder, g_bytes_new (buf, count), NULL);
 	if (!result) {
@@ -433,99 +446,14 @@ static bool __resize(RIO *io, RIODesc *fd, ut64 count) {
 static char *__system_continuation(RIO *io, RIODesc *fd, const char *command) {
 	JsonBuilder *builder;
 	JsonObject *result;
-	const char *value;
 	R_LOG_DEBUG ("system_continuation (%s)", command);
-
-	if (!strcmp (command, "help") || !strcmp (command, "h") || !strcmp (command, "?")) {
-		// TODO: move this into the .js
-		io->cb_printf ("r2frida commands are prefixed with `:` (alias for `=!`).\n"
-		":. script                   Run script\n"
-		":  frida-expression         Run given expression inside the agent\n"
-		":/[x][j] <string|hexpairs>  Search hex/string pattern in memory ranges (see search.in=?)\n"
-		":/v[1248][j] value          Search for a value honoring `e cfg.bigendian` of given width\n"
-		":/w[j] string               Search wide string\n"
-		":<space> code..             Evaluate Cycript code\n"
-		":?                          Show this help\n"
-		":?e message                 Show message like ?e but from the agent\n"
-		":?E title message           Show UIAlert dialog with given title and message\n"
-		":?V                         Show target Frida version\n"
-		":chcon file                 Change SELinux context (dl might require this)\n"
-		":d.                         Start the chrome tools debugger\n"
-		":dbn [addr|-addr]           List set, or delete a breakpoint\n"
-		":dbnc [addr] [command]      Associate an r2 command to an r2frida breakpoint\n"
-		":db (<addr>|<sym>)          List or place breakpoint (DEPRECATED)\n"
-		":db- (<addr>|<sym>)|*       Remove breakpoint(s) (DEPRECATED)\n"
-		":dc                         Continue breakpoints or resume a spawned process\n"
-		":dd[j-][fd] ([newfd])       List, dup2 or close filedescriptors (ddj for JSON)\n"
-		":di[0,1,-1,i,s,v] [addr]    Intercepts and replace return value of address without calling the function\n"
-		":dif[0,1,-1,i,s] [addr]     Intercepts return value of address after calling the function\n"
-		":dk ([pid]) [sig]           Send specific signal to specific pid in the remote system\n"
-		":dkr                        Print the crash report (if the app has crashed)\n"
-		":dl libname                 Dlopen a library (Android see chcon)\n"
-		":dl2 libname [main]         Inject library using Frida's >= 8.2 new API\n"
-		":dlf path                   Load a Framework Bundle (iOS) given its path\n"
-		":dlf- path                  Unload a Framework Bundle (iOS) given its path\n"
-		":dm[.|j|*]                  Show memory regions\n"
-		":dma <size>                 Allocate <size> bytes on the heap, address is returned\n"
-		":dma- (<addr>...)           Kill the allocations at <addr> (or all of them without param)\n"
-		":dmad <addr> <size>         Allocate <size> bytes on the heap, copy contents from <addr>\n"
-		":dmal                       List live heap allocations created with dma[s]\n"
-		":dmas <string>              Allocate a string initiated with <string> on the heap\n"
-		":dmaw <string>              Allocate a widechar string initiated with <string> on the heap\n"
-		":dmh                        List all heap allocated chunks\n"
-		":dmh*                       Export heap chunks and regions as r2 flags\n"
-		":dmhj                       List all heap allocated chunks in JSON\n"
-		":dmhm                       Show which maps are used to allocate heap chunks\n"
-		":dmm                        List all named squashed maps\n"
-		":dmp <addr> <size> <perms>  Change page at <address> with <size>, protection <perms> (rwx)\n"
-		":dp                         Show current pid\n"
-		":dpt                        Show threads\n"
-		":dr                         Show thread registers (see dpt)\n"
-		":dt (<addr>|<sym>) ..       Trace list of addresses or symbols\n"
-		":dt- (<addr>|<sym>)         Clear trace\n"
-		":dt-*                       Clear all tracing\n"
-		":dt.                        Trace at current offset\n"
-		":dtf <addr> [fmt]           Trace address with format (^ixzO) (see dtf?)\n"
-		":dth (addr|sym)(x:0 y:1 ..) Define function header (z=str,i=int,v=hex barray,s=barray)\n"
-		":dtl[-*] [msg]              debug trace log console, useful to .:T*\n"
-		":dtr <addr> (<regs>...)     Trace register values\n"
-		":dts[*j] seconds            Trace all threads for given seconds using the stalker\n"
-		":dtsf[*j] [sym|addr]        Trace address or symbol using the stalker (Frida >= 10.3.13)\n"
-		":dxc [sym|addr] [args..]    Call the target symbol with given args\n"
-		":e[?] [a[=b]]               List/get/set config evaluable vars\n"
-		":env [k[=v]]                Get/set environment variable\n"
-		":eval code..                Evaluate Javascript code in agent side\n"
-		":fd[*j] <address>           Inverse symbol resolution\n"
-		":i                          Show target information\n"
-		":iE[*] <lib>                Same as is, but only for the export global ones\n"
-		":iS[*]                      List sections\n"
-		":iS.                        Show section name of current address\n"
-		":iSj                        List sections in Json format\n"
-		":iSS[*]                     List segments\n"
-		":iSS.                       Show segment name of current address\n"
-		":iSSj                       List segments in Json format\n"
-		":ic <class>                 List Objective-C/Android Java classes, or methods of <class>\n"
-		":ii[*]                      List imports\n"
-		":il                         List libraries\n"
-		":ip <protocol>              List Objective-C protocols or methods of <protocol>\n"
-		":is[*] <lib>                List symbols of lib (local and global ones)\n"
-		":isa[*] (<lib>) <sym>       Show address of symbol\n"
-		":j java-expression          Run given expression inside a Java.perform(function(){}) block\n"
-		":r [r2cmd]                  Run r2 command using r_core_cmd_str API call (use 'dl libr2.so)\n"
-		":t [swift-module-name]      Show structs, enums, classes and protocols for a module (see swift: prefix)\n"
-		);
-		return NULL;
-	}
 
 	RIOFrida *rf = fd->data;
 
 	/* update state (seek and suspended) in agent */
 	{
-		char offstr[127] = {0};
 		JsonBuilder *builder = build_request ("state");
-		json_builder_set_member_name (builder, "offset");
-		snprintf (offstr, sizeof (offstr), "0x%"PFMT64x, io->off);
-		json_builder_add_string_value (builder, offstr);
+		add_offset_parameter (builder, io->off);
 		json_builder_set_member_name (builder, "suspended");
 		json_builder_add_boolean_value (builder, rf->suspended);
 		JsonObject *result = perform_request (rf, builder, NULL, NULL);
@@ -542,13 +470,20 @@ static char *__system_continuation(RIO *io, RIODesc *fd, const char *command) {
 		R_LOG_DEBUG ("empty command (.:i*)");
 		r_core_cmd0 (rf->r2core, ".:i*");
 		return NULL;
-	} else if (r_str_startswith (command, "%")) {
-		eprintf ("%s\n", helpmsg);
-		return false;
-	} else if (r_str_startswith (command, "o/")) {
+	}
+	if (r_str_startswith (command, "%")) {
+		// this shortcut should be implemented inside the js code
+		r_core_cmdf (rf->r2core, ":env %s", command + 1);
+		return NULL;
+	}
+	if (r_str_startswith (command, "???")) {
+		return strdup (helpmsg);
+	}
+	if (r_str_startswith (command, "o/")) {
 		r_core_cmd0 (rf->r2core, "?E Yay!");
 		return NULL;
-	} else if (r_str_startswith (command, "d.")) {
+	}
+	if (r_str_startswith (command, "d.")) {
 #if WANT_SESSION_DEBUGGER
 		int port = 0; // 9229
 		if (command[2] == ' ') {
@@ -596,20 +531,20 @@ static char *__system_continuation(RIO *io, RIODesc *fd, const char *command) {
 		io->cb_printf ("  stalker.timeout = 300\n");
 		io->cb_printf ("  stalker.in      = raw\n");
 	// fails to aim at seek workarounding hostCmd
-	} else if (!strncmp (command, "s  ", 3)) {
+	} else if (r_str_startswith (command, "s  ")) {
 		if (rf && rf->r2core) {
 			r_core_cmdf (rf->r2core, "s %s", command + 2);
 		} else {
 			R_LOG_ERROR ("Invalid r2 core instance");
 		}
 		return NULL;
-	} else if (!strncmp (command, "dkr", 3)) {
+	} else if (r_str_startswith (command, "dkr")) {
 		io->cb_printf ("DetachReason: %s\n", detachReasonAsString (rf));
 		if (rf->crash_report) {
 			io->cb_printf ("%s\n", rf->crash_report);
 		}
 		return NULL;
-	} else if (!strncmp (command, "dl2", 3)) {
+	} else if (r_str_startswith (command, "dl2")) {
 		if (command[3] == ' ') {
 			GError *error = NULL;
 			gchar *path = r_str_trim_dup (command + 3);
@@ -638,7 +573,6 @@ static char *__system_continuation(RIO *io, RIODesc *fd, const char *command) {
 		resume (rf);
 		return NULL;
 	}
-
 	char *slurpedData = NULL;
 	if (command[0] == '.') {
 		switch (command[1]) {
@@ -736,18 +670,28 @@ static char *__system_continuation(RIO *io, RIODesc *fd, const char *command) {
 	}
 	free (slurpedData);
 
+	rf->inputmode = true;
 	result = perform_request (rf, builder, NULL, NULL);
 	if (!result) {
 		return NULL;
 	}
+	{
+		char *s = r_strbuf_drain (rf->sb);
+		if (*s) {
+			io->cb_printf ("%s\n", s);
+		}
+		free (s);
+		rf->sb = r_strbuf_new ("");
+	}
+	rf->inputmode = false;
 
 	if (!json_object_has_member (result, "value")) {
 		return NULL;
 	}
-	value = json_object_get_string_member (result, "value");
+	const char *value = json_object_get_string_member (result, "value");
 	char *sys_result = NULL;
 	if (value && strcmp (value, "undefined")) {
-		bool is_fs_io = command[0] == 'm';
+		const bool is_fs_io = command[0] == 'm' || command[0] == 'd';
 		if (is_fs_io) {
 			sys_result = strdup (value);
 		} else {
@@ -760,25 +704,23 @@ static char *__system_continuation(RIO *io, RIODesc *fd, const char *command) {
 }
 
 static void load_scripts(RCore *core, RIODesc *fd, const char *path) {
-	if (!core || !fd || !path) {
-		return;
-	}
+	r_return_if_fail (core && fd && path);
 	RList *files = r_sys_dir (path);
 	RListIter *iter;
 	const char *file;
 	r_list_foreach (files, iter, file) {
 		if (r_str_endswith (file, ".js")) {
 			char *cmd = r_str_newf (". %s"R_SYS_DIR"%s", path, file);
-			if (r2f_debug_uri()) {
+			if (r2f_debug_uri ()) {
 				R_LOG_INFO ("Loading %s", file);
 			}
-			char * s = __system_continuation (core->io, fd, cmd);
+			char *s = __system_continuation (core->io, fd, cmd);
 			free (cmd);
 			if (s) {
-				eprintf ("%s\n", s);
+				r_cons_printf ("%s\n", s);
+				// eprintf ("%s\n", s);
 				free (s);
 			}
-
 		}
 	}
 }
@@ -1035,6 +977,14 @@ static RIODesc *__open(RIO *io, const char *pathname, int rw, int mode) {
 	r2frida_launchopt_free (lo);
 
 	/* load scripts */
+	{
+		char *r2fridarc = r_file_home (".r2fridarc");
+		if (r_file_exists (r2fridarc)) {
+			r_core_cmdf (rf->r2core, "-i %s", r2fridarc);
+		}
+		free (r2fridarc);
+	}
+
 	RCore *core = rf->r2core;
 	load_scripts (core, fd, R2_DATDIR "/r2frida/scripts");
 
@@ -1085,9 +1035,7 @@ static FridaDevice *get_device_manager(FridaDeviceManager *manager, const char *
 }
 
 static char *__system(RIO *io, RIODesc *fd, const char *command) {
-	if (!io || !fd || !command) {
-		return NULL;
-	}
+	r_return_val_if_fail (io && fd && command, NULL);
 	return __system_continuation (io, fd, command);
 }
 
@@ -1325,6 +1273,8 @@ static bool resolve4(RIOFrida *rf, RList *args, R2FridaLaunchOptions *lo, GCance
 	return false;
 }
 
+#include "urimaker.inc.c"
+
 static bool resolve_target(RIOFrida *rf, const char *pathname, R2FridaLaunchOptions *lo, GCancellable *cancellable) {
 	const char *first_field = pathname + 8;
 	// local, usb, remote
@@ -1340,18 +1290,34 @@ static bool resolve_target(RIOFrida *rf, const char *pathname, R2FridaLaunchOpti
 	if (strncmp (pathname, "frida://", uri_len)) {
 		return false;
 	}
-	if (!pathname[uri_len]) {
-		GError *error = NULL;
-		FridaDevice *device = get_device_manager (rf->device_manager, "local", cancellable, &error);
-		if (device) {
-			dumpProcesses (device, cancellable);
-			g_object_unref (device);
-		} else {
-			R_LOG_ERROR ("Cannot find device.\n");
-		}
-		return false;
-	}
 	char *a = strdup (pathname + uri_len);
+	if (!pathname[uri_len]) {
+		char *r2coreptr = r_sys_getenv ("R2COREPTR");
+		const bool in_iaito = R_STR_ISNOTEMPTY (r2coreptr);
+		free (r2coreptr);
+		if (in_iaito) {
+			eprintf ("%s\n", helpmsg);
+			return false;
+		}
+		char *newa = construct_uri (rf);
+		if (newa) {
+			free (a);
+			R_LOG_INFO ("Redirecting to frida://%s", newa);
+			a = newa;
+		} else {
+			eprintf ("%s\n", helpmsg);
+			return false;
+		}
+	}
+#if 0
+	if (!strcmp (a, "-")) {
+		char *newa = construct_uri (rf);
+		if (newa) {
+			free (a);
+			a = newa;
+		}
+	}
+#endif
 	if (*a == '/' || !strncmp (a, "./", 2)) {
 		// frida:///path/to/file
 		lo->spawn = true;
@@ -1454,6 +1420,13 @@ static JsonBuilder *build_request(const char *type) {
 	return builder;
 }
 
+static void add_offset_parameter(JsonBuilder *builder, ut64 off) {
+	char offstr[2 + 16 + 1];
+	json_builder_set_member_name (builder, "offset");
+	snprintf (offstr, sizeof (offstr), "0x%"PFMT64x, off);
+	json_builder_add_string_value (builder, offstr);
+}
+
 static JsonObject *perform_request(RIOFrida *rf, JsonBuilder *builder, GBytes *data, GBytes **bytes) {
 	JsonObject *reply_stanza = NULL;
 	GBytes *reply_bytes = NULL;
@@ -1531,7 +1504,11 @@ static void exec_pending_cmd_if_needed(RIOFrida * rf) {
 	if (!rf->pending_cmd) {
 		return;
 	}
+#if R2_VERSION_NUMBER >= 50909
+	char *output = COREBIND (rf->io).cmdStr (rf->r2core, rf->pending_cmd->cmd_string);
+#else
 	char *output = COREBIND (rf->io).cmdstr (rf->r2core, rf->pending_cmd->cmd_string);
+#endif
 
 	ut64 serial = rf->pending_cmd->serial;
 	pending_cmd_free (rf->pending_cmd);
@@ -1567,14 +1544,15 @@ static void perform_request_unlocked(RIOFrida *rf, JsonBuilder *builder, GBytes 
 
 static void on_stanza(RIOFrida *rf, JsonObject *stanza, GBytes *bytes) {
 	g_mutex_lock (&rf->lock);
-
-	g_assert (!rf->reply_stanza && !rf->reply_bytes);
-
 	rf->received_reply = true;
 	rf->reply_stanza = stanza;
 	rf->reply_bytes = bytes? g_bytes_ref (bytes): NULL;
+	if (!rf->reply_stanza && !rf->reply_bytes) {
+		// some messages don't require an ack. let's just move on
+		R_LOG_DEBUG ("rf->reply_{stanza(%p) & bytes(%p)} are null",
+				rf->reply_stanza, rf->reply_bytes);
+	}
 	g_cond_signal (&rf->cond);
-
 	g_mutex_unlock (&rf->lock);
 }
 
@@ -1600,11 +1578,10 @@ static void on_detached(FridaSession *session, FridaSessionDetachReason reason, 
 
 static void on_breakpoint_event(RIOFrida *rf, JsonObject *cmd_stanza) {
 	g_mutex_lock (&rf->lock);
-	g_assert (!rf->pending_cmd);
 	if (json_object_has_member (cmd_stanza, "cmd")) {
 		const char *command = json_object_get_string_member (cmd_stanza, "cmd");
 		if (R_STR_ISNOTEMPTY (command)) {
-			r_core_cmd0 (rf->r2core, command);
+			r_core_cmd_queue (rf->r2core, command);
 			r_cons_flush ();
 		}
 	}
@@ -1618,11 +1595,120 @@ static void on_cmd(RIOFrida *rf, JsonObject *cmd_stanza) {
 	g_assert (!rf->pending_cmd);
 	if (cmd_stanza) {
 		rf->pending_cmd = pending_cmd_create (cmd_stanza);
+		R_LOG_DEBUG ("r2f.hostCmd(%s)", rf->pending_cmd->cmd_string);
 	} else {
 		rf->pending_cmd = R_NEW0 (RFPendingCmd);
 	}
 	g_cond_signal (&rf->cond);
 	g_mutex_unlock (&rf->lock);
+}
+
+static void on_message_send(RIOFrida *rf, FridaScript *script, JsonObject *root, const char *raw_message, GBytes *data) {
+	JsonNode *payload_node = json_object_get_member (root, "payload");
+	JsonNodeType type = json_node_get_node_type (payload_node);
+	if (type == JSON_NODE_OBJECT) {
+		JsonObject *payload = json_object_ref (json_object_get_object_member (root, "payload"));
+		if (payload && json_object_has_member (payload, "stanza")) {
+			JsonObject *stanza = json_object_get_object_member (payload, "stanza");
+			const char *name = json_object_get_string_member (payload, "name");
+
+			if (name && !strcmp (name, "reply")) {
+				if (stanza) {
+					JsonNode *stanza_node = json_object_get_member (payload, "stanza");
+					JsonNodeType stanza_type = json_node_get_node_type (stanza_node);
+					if (stanza_type == JSON_NODE_OBJECT) {
+						on_stanza (rf, json_object_ref (json_object_get_object_member (payload, "stanza")), data);
+					} else {
+						R_LOG_ERROR ("Bug in the agent, cannot find stanza in the message: %s", raw_message);
+					}
+				} else {
+					R_LOG_ERROR ("Bug in the agent, expected an object: %s", raw_message);
+				}
+			} else if (name && !strcmp (name, "breakpoint-event")) {
+				on_breakpoint_event (rf, json_object_get_object_member (payload, "stanza"));
+			} else if (name && !strcmp (name, "cmd")) {
+				on_cmd (rf, json_object_get_object_member (payload, "stanza"));
+			} else if (name && !strcmp (name, "log")) {
+				JsonNode *stanza_node = json_object_get_member (payload, "stanza");
+				if (stanza && stanza_node) {
+					JsonNode *message_node = json_object_get_member (stanza, "message");
+					if (message_node) {
+						JsonNodeType type = json_node_get_node_type (message_node);
+						char *message = NULL;
+						if (type == JSON_NODE_OBJECT) {
+							message = json_to_string (message_node, FALSE);
+						} else {
+							const char *cmessage = json_object_get_string_member (stanza, "message");
+							if (cmessage) {
+								message = strdup (cmessage);
+							}
+						}
+						if (message) {
+							eprintf ("%s\n", message);
+							free (message);
+						}
+					}
+				} else {
+					R_LOG_WARN ("Missing stanza for log message");
+				}
+			} else if (name && !strcmp (name, "log-file")) {
+				JsonNode *stanza_node = json_object_get_member (payload, "stanza");
+				if (stanza && stanza_node) {
+					const char *filename = json_object_get_string_member (stanza, "filename");
+					JsonNode *message_node = json_object_get_member (stanza, "message");
+					if (message_node) {
+						JsonNodeType type = json_node_get_node_type (message_node);
+						char *message = (type == JSON_NODE_OBJECT)
+							? json_to_string (message_node, FALSE)
+							: strdup (json_object_get_string_member (stanza, "message"));
+						if (filename && message) {
+							bool sent = false;
+							message = r_str_append (message, "\n");
+							if (*filename == '|') {
+								// redirect the message to a program shell
+								char *emsg = r_str_escape (message);
+								r_sys_cmdf ("%s \"%s\"", r_str_trim_head_ro (filename + 1), emsg);
+								free (emsg);
+							} else if (r_str_startswith (filename, "tcp:")) {
+								char *host = strdup (filename + 4);
+								char *port = strchr (host, ':');
+								if (port) {
+									*port++ = 0;
+									if (!r_socket_is_connected (rf->s)) {
+										(void)r_socket_connect (rf->s, host, port, R_SOCKET_PROTO_TCP, 0);
+									}
+									if (r_socket_is_connected (rf->s)) {
+										size_t msglen = strlen (message);
+										if (r_socket_write (rf->s, message, msglen) == msglen) {
+											sent = true;
+										}
+									}
+								}
+							}
+							if (!sent) {
+								(void) r_file_dump (filename, (const ut8*)message, -1, true);
+							}
+						}
+						free (message);
+					} else {
+						R_LOG_WARN ("Missing message node");
+					}
+					// json_node_unref (stanza_node);
+				} else {
+					R_LOG_WARN ("Missing stanza for log-file message");
+				}
+			} else {
+				if (!r_str_startswith (name, "action-")) {
+					R_LOG_WARN ("Unknown packet named '%s'", name);
+				}
+			}
+			json_object_unref (payload);
+		} else {
+			R_LOG_ERROR ("Unexpected payload (%s)", raw_message);
+		}
+	} else {
+		R_LOG_ERROR ("Bug in the agent, expected an object: %s", raw_message);
+	}
 }
 
 static void on_message(FridaScript *script, const char *raw_message, GBytes *data, gpointer user_data) {
@@ -1636,128 +1722,25 @@ static void on_message(FridaScript *script, const char *raw_message, GBytes *dat
 	}
 
 	if (!strcmp (type, "send")) {
-		JsonNode *payload_node = json_object_get_member (root, "payload");
-		JsonNodeType type = json_node_get_node_type (payload_node);
-		if (type == JSON_NODE_OBJECT) {
-			JsonObject *payload = json_object_ref (json_object_get_object_member (root, "payload"));
-			if (payload && json_object_has_member (payload, "stanza")) {
-				JsonObject *stanza = json_object_get_object_member (payload, "stanza");
-				const char *name = json_object_get_string_member (payload, "name");
-
-				if (name && !strcmp (name, "reply")) {
-					if (stanza) {
-						JsonNode *stanza_node = json_object_get_member (payload, "stanza");
-						JsonNodeType stanza_type = json_node_get_node_type (stanza_node);
-						if (stanza_type == JSON_NODE_OBJECT) {
-							on_stanza (rf, json_object_ref (json_object_get_object_member (payload, "stanza")), data);
-						} else {
-							R_LOG_ERROR ("Bug in the agent, cannot find stanza in the message: %s", raw_message);
-						}
-					} else {
-						R_LOG_ERROR ("Bug in the agent, expected an object: %s", raw_message);
-					}
-				} else if (name && !strcmp (name, "breakpoint-event")) {
-					on_breakpoint_event (rf, json_object_get_object_member (payload, "stanza"));
-				} else if (name && !strcmp (name, "cmd")) {
-					on_cmd (rf, json_object_get_object_member (payload, "stanza"));
-				} else if (name && !strcmp (name, "log")) {
-					JsonNode *stanza_node = json_object_get_member (payload, "stanza");
-					if (stanza && stanza_node) {
-						JsonNode *message_node = json_object_get_member (stanza, "message");
-						if (message_node) {
-							JsonNodeType type = json_node_get_node_type (message_node);
-							char *message = NULL;
-							if (type == JSON_NODE_OBJECT) {
-								message = json_to_string (message_node, FALSE);
-							} else {
-								const char *cmessage = json_object_get_string_member (stanza, "message");
-								if (cmessage) {
-									message = strdup (cmessage);
-								}
-							}
-							if (message) {
-								eprintf ("%s\n", message);
-								free (message);
-							}
-						}
-					} else {
-						R_LOG_WARN ("Missing stanza for log message");
-					}
-				} else if (name && !strcmp (name, "log-file")) {
-					JsonNode *stanza_node = json_object_get_member (payload, "stanza");
-					if (stanza && stanza_node) {
-						const char *filename = json_object_get_string_member (stanza, "filename");
-						JsonNode *message_node = json_object_get_member (stanza, "message");
-						if (message_node) {
-							JsonNodeType type = json_node_get_node_type (message_node);
-							char *message = (type == JSON_NODE_OBJECT)
-								? json_to_string (message_node, FALSE)
-								: strdup (json_object_get_string_member (stanza, "message"));
-							if (filename && message) {
-								bool sent = false;
-								message = r_str_append (message, "\n");
-								if (*filename == '|') {
-									// redirect the message to a program shell
-									char *emsg = r_str_escape (message);
-									r_sys_cmdf ("%s \"%s\"", r_str_trim_head_ro (filename + 1), emsg);
-									free (emsg);
-								} else if (r_str_startswith (filename, "tcp:")) {
-									char *host = strdup (filename + 4);
-									char *port = strchr (host, ':');
-									if (port) {
-										*port++ = 0;
-										if (!r_socket_is_connected (rf->s)) {
-											(void)r_socket_connect (rf->s, host, port, R_SOCKET_PROTO_TCP, 0);
-										}
-										if (r_socket_is_connected (rf->s)) {
-											size_t msglen = strlen (message);
-											if (r_socket_write (rf->s, message, msglen) == msglen) {
-												sent = true;
-											}
-										}
-									}
-								}
-								if (!sent) {
-									(void) r_file_dump (filename, (const ut8*)message, -1, true);
-								}
-							}
-							free (message);
-						} else {
-							R_LOG_WARN ("Missing message node");
-						}
-						// json_node_unref (stanza_node);
-					} else {
-						R_LOG_WARN ("Missing stanza for log-file message");
-					}
-				} else {
-					if (!r_str_startswith (name, "action-")) {
-						R_LOG_WARN ("Unknown packet named '%s'", name);
-					}
-				}
-				json_object_unref (payload);
-			} else {
-				R_LOG_ERROR ("Unexpected payload (%s)", raw_message);
-			}
-		} else {
-			R_LOG_ERROR ("Bug in the agent, expected an object: %s", raw_message);
-		}
+		on_message_send (rf, script, root, raw_message, data);
 	} else if (!strcmp (type, "log")) {
 		// This is reached from the agent when calling console.log
 		JsonNode *payload_node = json_object_get_member (root, "payload");
 		// JsonNodeType type = json_node_get_node_type (payload_node);
 		const char *message = json_node_get_string (payload_node);
 		if (message) {
-			const char *cmd_prefix = "[r2cmd]";
+			const char cmd_prefix[] = "[r2cmd]";
 			if (r_str_startswith (message, cmd_prefix)) {
 				const char *cmd = message + strlen (cmd_prefix);
 				// eprintf ("Running r2 command: '%s'\n", cmd);
-#if ((R2_VERSION_MAJOR == 5 && R2_VERSION_MINOR >= 4) || R2_VERSION_MAJOR > 5)
 				r_core_cmd_queue (rf->r2core, cmd);
-#else
-				r_core_cmd0 (rf->r2core, cmd);
-#endif
 			} else {
-				eprintf ("%s\n", message);
+				// eprintf ("LOG MESSAGE RECEIVED (%s)\n", message);
+				if (rf->inputmode) {
+					r_strbuf_append (rf->sb, message);
+				} else {
+					eprintf ("%s\n", message);
+				}
 			}
 		} else {
 			R_LOG_ERROR ("Missing message: %s", message);
@@ -1774,22 +1757,18 @@ static void dumpDevices(RIOFrida *rf, GCancellable *cancellable) {
 		printf ("dump-devices\n");
 		return;
 	}
-	FridaDeviceList *list;
-	GArray *devices;
-	gint num_devices, i;
-	GError *error;
-
-	error = NULL;
-	list = frida_device_manager_enumerate_devices_sync (rf->device_manager, cancellable, &error);
+	gint i;
+	GError *error = NULL;
+	FridaDeviceList *list = frida_device_manager_enumerate_devices_sync (rf->device_manager, cancellable, &error);
 	if (error) {
 		if (!g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
 			R_LOG_ERROR ("%s", error->message);
 		}
 		goto beach;
 	}
-	num_devices = frida_device_list_size (list);
+	gint num_devices = frida_device_list_size (list);
 
-	devices = g_array_sized_new (FALSE, FALSE, sizeof (FridaDevice *), num_devices);
+	GArray *devices = g_array_sized_new (FALSE, FALSE, sizeof (FridaDevice *), num_devices);
 	for (i = 0; i != num_devices; i++) {
 		FridaDevice *device = frida_device_list_get (list, i);
 		g_array_append_val (devices, device);
@@ -1797,7 +1776,7 @@ static void dumpDevices(RIOFrida *rf, GCancellable *cancellable) {
 	}
 	g_array_sort (devices, compareDevices);
 
-	print_list(DEVICES, devices, num_devices);
+	print_list (DEVICES, devices, num_devices);
 beach:
 	g_clear_error (&error);
 	g_clear_object (&list);
@@ -1847,17 +1826,15 @@ beach:
 
 static char *resolve_process_name_by_package_name(FridaDevice *device, GCancellable *cancellable, const char *bundleid) {
 	char *res = NULL;
-	FridaApplicationList *list;
 	gint i;
-	GError *error;
 
 	if (r2f_debug_uri ()) {
 		printf ("resolve_process_name_by_package_name\n");
 		return NULL;
 	}
 
-	error = NULL;
-	list = frida_device_enumerate_applications_sync (device, NULL, cancellable, &error);
+	GError *error = NULL;
+	FridaApplicationList *list = frida_device_enumerate_applications_sync (device, NULL, cancellable, &error);
 	if (error != NULL) {
 		if (!g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
 			R_LOG_ERROR ("%s", error->message);
@@ -2065,15 +2042,24 @@ error:
 }
 
 RIOPlugin r_io_plugin_frida = {
+#if R2_VERSION_NUMBER >= 50809
+	.meta = {
+		.name = "frida",
+		.desc = "io plugin for Frida " FRIDA_VERSION_STRING,
+		.license = "MIT",
+		.version = R2FRIDA_VERSION_STRING
+	},
+#else
 	.name = "frida",
 	.desc = "io plugin for Frida " FRIDA_VERSION_STRING,
-	.uris = "frida://",
 	.license = "MIT",
+#endif
+	.uris = "frida://",
 	.open = __open,
 	.close = __close,
 	.read = __read,
 	.check = __check,
-#if ((R2_VERSION_MAJOR == 5 && R2_VERSION_MINOR >= 4) || R2_VERSION_MAJOR > 5)
+#if R2_VERSION_NUMBER >= 50405
 	.seek = __lseek,
 #else
 	.lseek = __lseek,

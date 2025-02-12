@@ -1,3 +1,4 @@
+import { traceEmit } from '../../../agent/log.js';
 import config from '../../config.js';
 import { parseTargetJavaExpression, interceptFunRetJava, interceptRetJava } from '../java/index.js';
 import { getPtr } from '../utils.js';
@@ -8,7 +9,7 @@ function interceptHelp(args: string[]) : string {
         "div java:org.ex.class.method  # when program calls this address, the original function is not called and no value is returned.\n";
 }
 
-function interceptFunHelp(args: string[]) {
+function interceptFunHelp(args: string[]): string {
     return "Usage: dif[0,1,-1,s] [addr] [str] [param_types]: intercepts function method, call it, and replace the return value.\n"+
         "dif0 0x808080  # when program calls this address, the original function is called, then return value is replaced.\n" +
         "dif0 java:com.example.MainActivity.method1 int,java.lang.String  # Only with JVM methods. You need to define param_types when overload a Java method.\n" +
@@ -97,6 +98,7 @@ function _interceptRet(target: any, value: any) {
     const funcPtr = getPtr(target);
     const useCmd = config.getString('hook.usecmd');
     Interceptor.replace(funcPtr, new NativeCallback(function () {
+        traceEmit(`Intercept return for ${target.toString()} with ${value.toString()}`);
         if (useCmd.length > 0) {
             console.log('[r2cmd]' + useCmd);
         }
@@ -112,9 +114,23 @@ function _interceptFunRet(target: string, value: string | number, paramTypes: st
     const p = getPtr(target);
     Interceptor.attach(p, {
         onLeave(retval) {
+            traceEmit(`Target: ${target.toString()} was called, intercepting return value.`)
             retval.replace(ptr(value));
         }
     });
+}
+
+export function interceptDetachAll(args: string[]) {
+    Interceptor.detachAll();
+    console.log(`Reverted all hooks`)
+}
+
+export function interceptRevert(args: string[]) {
+    if (args.length > 0) {
+        const p = getPtr(args[0])
+        Interceptor.revert(p)
+        console.log(`Reverted hooks at ${p.toString()}`)
+    }
 }
 
 export default {
@@ -132,5 +148,7 @@ export default {
     interceptFunRet0,
     interceptFunRet1,
     interceptFunRetInt,
-    interceptFunRet_1
+    interceptFunRet_1,
+    interceptDetachAll,
+    interceptRevert
 };
